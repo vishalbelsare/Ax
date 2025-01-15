@@ -4,15 +4,14 @@
 # This source code is licensed under the MIT license found in the
 # LICENSE file in the root directory of this source tree.
 
+# pyre-strict
+
 from ax.core.arm import Arm
 from ax.utils.common.testutils import TestCase
 
 
 class ArmTest(TestCase):
-    def setUp(self):
-        pass
-
-    def testInit(self):
+    def test_Init(self) -> None:
         arm = Arm(parameters={"y": 0.25, "x": 0.75, "z": 75})
         self.assertEqual(str(arm), "Arm(parameters={'y': 0.25, 'x': 0.75, 'z': 75})")
 
@@ -22,7 +21,7 @@ class ArmTest(TestCase):
             "Arm(name='status_quo', parameters={'y': 0.25, 'x': 0.75, 'z': 75})",
         )
 
-    def testNameValidation(self):
+    def test_NameValidation(self) -> None:
         arm = Arm(parameters={"y": 0.25, "x": 0.75, "z": 75})
         self.assertFalse(arm.has_name)
         with self.assertRaises(ValueError):
@@ -31,14 +30,14 @@ class ArmTest(TestCase):
         with self.assertRaises(ValueError):
             arm.name = "1_0"
 
-    def testNameOrShortSignature(self):
+    def test_NameOrShortSignature(self) -> None:
         arm = Arm(parameters={"y": 0.25, "x": 0.75, "z": 75}, name="0_0")
         self.assertEqual(arm.name_or_short_signature, "0_0")
 
         arm = Arm(parameters={"y": 0.25, "x": 0.75, "z": 75})
-        self.assertEqual(arm.name_or_short_signature, arm.signature[-4:])
+        self.assertEqual(arm.name_or_short_signature, arm.signature[-8:])
 
-    def testEq(self):
+    def test_Eq(self) -> None:
         arm1 = Arm(parameters={"y": 0.25, "x": 0.75, "z": 75})
         arm2 = Arm(parameters={"z": 75, "x": 0.75, "y": 0.25})
         self.assertEqual(arm1, arm2)
@@ -53,14 +52,14 @@ class ArmTest(TestCase):
         arm6 = Arm(name="0_1", parameters={"y": 0.25, "x": 0.75, "z": 75})
         self.assertNotEqual(arm4, arm6)
 
-    def testClone(self):
+    def test_Clone(self) -> None:
         arm1 = Arm(parameters={"y": 0.25, "x": 0.75, "z": 75})
         arm2 = arm1.clone()
         self.assertFalse(arm1 is arm2)
         self.assertEqual(arm1, arm2)
         self.assertFalse(arm1.parameters is arm2.parameters)
 
-    def testSortable(self):
+    def test_Sortable(self) -> None:
         arm1 = Arm(parameters={"y": 0.25, "x": 0.75, "z": 75})
         arm2 = Arm(parameters={"z": 0, "x": 0, "y": 0})
         self.assertTrue(arm1 < arm2)

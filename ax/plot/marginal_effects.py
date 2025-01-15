@@ -4,7 +4,9 @@
 # This source code is licensed under the MIT license found in the
 # LICENSE file in the root directory of this source tree.
 
-from typing import Any, List
+# pyre-strict
+
+from typing import Any
 
 import pandas as pd
 import plotly.graph_objs as go
@@ -36,10 +38,11 @@ def plot_marginal_effects(model: ModelBridge, metric: str) -> AxPlotConfig:
         arm_df["mean"] = arm.y_hat[metric]
         arm_df["sem"] = arm.se_hat[metric]
         arm_dfs.append(arm_df)
-    effect_table = marginal_effects(pd.concat(arm_dfs, 0))
+    effect_table = marginal_effects(pd.concat(arm_dfs, axis=0))
 
     varnames = effect_table["Name"].unique()
-    data: List[Any] = []
+    # pyre-fixme[33]: Given annotation cannot contain `Any`.
+    data: list[Any] = []
     for varname in varnames:
         var_df = effect_table[effect_table["Name"] == varname]
         data += [
@@ -63,7 +66,8 @@ def plot_marginal_effects(model: ModelBridge, metric: str) -> AxPlotConfig:
     # fig.layout.margin = go.layout.Margin(l=2, r=2)
     fig.layout.title = "Marginal Effects by Factor"
     fig.layout.yaxis = {
-        "title": "% better than experiment average",
-        "hoverformat": ".{}f".format(DECIMALS),
+        "title": "% higher than experiment average",
+        "hoverformat": f".{DECIMALS}f",
     }
+    # pyre-fixme[6]: For 1st argument expected `Dict[str, typing.Any]` but got `Figure`.
     return AxPlotConfig(data=fig, plot_type=AxPlotTypes.GENERIC)

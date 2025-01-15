@@ -2,27 +2,19 @@
     :class: hidden-section
 
 ax.models
-===================================
+=========
 
 .. automodule:: ax.models
 .. currentmodule:: ax.models
 
 
-Base Models
----------------
+Base Models & Utilities
+-----------------------
 
 ax.models.base
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+~~~~~~~~~~~~~~
 
 .. automodule:: ax.models.base
-    :members:
-    :undoc-members:
-    :show-inheritance:
-
-ax.models.types
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
-.. automodule:: ax.models.types
     :members:
     :undoc-members:
     :show-inheritance:
@@ -35,6 +27,14 @@ ax.models.discrete\_base module
     :undoc-members:
     :show-inheritance:
 
+ax.models.torch\_base module
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+.. automodule:: ax.models.torch_base
+    :members:
+    :undoc-members:
+    :show-inheritance:
+
 ax.models.model\_utils module
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
@@ -43,25 +43,25 @@ ax.models.model\_utils module
     :undoc-members:
     :show-inheritance:
 
-ax.models.numpy\_base module
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+ax.models.types
+~~~~~~~~~~~~~~~
 
-.. automodule:: ax.models.numpy_base
+.. automodule:: ax.models.types
     :members:
     :undoc-members:
     :show-inheritance:
 
-ax.models.torch\_base module
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+ax.models.winsorization\_config module
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-.. automodule:: ax.models.torch_base
+.. automodule:: ax.models.winsorization_config
     :members:
     :undoc-members:
     :show-inheritance:
 
 
 Discrete Models
-----------------
+---------------
 
 ax.models.discrete.eb\_thompson module
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -72,7 +72,7 @@ ax.models.discrete.eb\_thompson module
     :show-inheritance:
 
 ax.models.discrete.full\_factorial module
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 .. automodule:: ax.models.discrete.full_factorial
     :members:
@@ -80,7 +80,7 @@ ax.models.discrete.full\_factorial module
     :show-inheritance:
 
 ax.models.discrete.thompson module
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 .. automodule:: ax.models.discrete.thompson
     :members:
@@ -88,49 +88,14 @@ ax.models.discrete.thompson module
     :show-inheritance:
 
 
-NumPy Models
-----------------
-
-ax.models.numpy.randomforest module
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
-.. automodule:: ax.models.numpy.randomforest
-    :members:
-    :undoc-members:
-    :show-inheritance:
-
 
 Random Models
-----------------
-
-ax.models.random.alebo_initializer module
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
-.. automodule:: ax.models.random.alebo_initializer
-    :members:
-    :undoc-members:
-    :show-inheritance:
+-------------
 
 ax.models.random.base module
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 .. automodule:: ax.models.random.base
-    :members:
-    :undoc-members:
-    :show-inheritance:
-
-ax.models.random.rembo_initializer module
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
-.. automodule:: ax.models.random.rembo_initializer
-    :members:
-    :undoc-members:
-    :show-inheritance:
-
-ax.models.random.sobol module
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
-.. automodule:: ax.models.random.sobol
     :members:
     :undoc-members:
     :show-inheritance:
@@ -143,20 +108,19 @@ ax.models.random.uniform module
     :undoc-members:
     :show-inheritance:
 
+ax.models.random.sobol module
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-Torch Models
-----------------
-
-ax.models.torch.alebo module
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
-.. automodule:: ax.models.torch.alebo
+.. automodule:: ax.models.random.sobol
     :members:
     :undoc-members:
     :show-inheritance:
 
+Torch Models & Utilities
+------------------------
+
 ax.models.torch.botorch module
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 .. automodule:: ax.models.torch.botorch
     :members:
@@ -164,31 +128,15 @@ ax.models.torch.botorch module
     :show-inheritance:
 
 ax.models.torch.botorch_defaults module
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 .. automodule:: ax.models.torch.botorch_defaults
     :members:
     :undoc-members:
     :show-inheritance:
 
-ax.models.torch.botorch_kg module
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
-.. automodule:: ax.models.torch.botorch_kg
-    :members:
-    :undoc-members:
-    :show-inheritance:
-
-ax.models.torch.botorch_mes module
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
-.. automodule:: ax.models.torch.botorch_mes
-    :members:
-    :undoc-members:
-    :show-inheritance:
-
 ax.models.torch.botorch_moo module
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 .. automodule:: ax.models.torch.botorch_moo
     :members:
@@ -196,7 +144,7 @@ ax.models.torch.botorch_moo module
     :show-inheritance:
 
 ax.models.torch.botorch_moo_defaults module
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 .. automodule:: ax.models.torch.botorch_moo_defaults
     :members:
@@ -204,31 +152,23 @@ ax.models.torch.botorch_moo_defaults module
     :show-inheritance:
 
 ax.models.torch.botorch_modular.acquisition module
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 .. automodule:: ax.models.torch.botorch_modular.acquisition
     :members:
     :undoc-members:
     :show-inheritance:
 
-ax.models.torch.botorch_modular.default_options module
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+ax.models.torch.randomforest module
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-.. automodule:: ax.models.torch.botorch_modular.default_options
-    :members:
-    :undoc-members:
-    :show-inheritance:
-
-ax.models.torch.botorch_modular.list_surrogate module
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
-.. automodule:: ax.models.torch.botorch_modular.list_surrogate
+.. automodule:: ax.models.torch.randomforest
     :members:
     :undoc-members:
     :show-inheritance:
 
 ax.models.torch.botorch_modular.model module
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 .. automodule:: ax.models.torch.botorch_modular.model
     :members:
@@ -236,7 +176,7 @@ ax.models.torch.botorch_modular.model module
     :show-inheritance:
 
 ax.models.torch.botorch_modular.multi_fidelity module
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 .. automodule:: ax.models.torch.botorch_modular.multi_fidelity
     :members:
@@ -244,15 +184,23 @@ ax.models.torch.botorch_modular.multi_fidelity module
     :show-inheritance:
 
 ax.models.torch.botorch_modular.optimizer_argparse module
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 .. automodule:: ax.models.torch.botorch_modular.optimizer_argparse
     :members:
     :undoc-members:
     :show-inheritance:
 
+ax.models.torch.botorch_modular.sebo module
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+.. automodule:: ax.models.torch.botorch_modular.sebo
+    :members:
+    :undoc-members:
+    :show-inheritance:
+
 ax.models.torch.botorch_modular.surrogate module
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 .. automodule:: ax.models.torch.botorch_modular.surrogate
     :members:
@@ -260,15 +208,47 @@ ax.models.torch.botorch_modular.surrogate module
     :show-inheritance:
 
 ax.models.torch.botorch_modular.utils module
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 .. automodule:: ax.models.torch.botorch_modular.utils
     :members:
     :undoc-members:
     :show-inheritance:
 
+ax.models.torch.botorch_modular.kernels module
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+.. automodule:: ax.models.torch.botorch_modular.kernels
+    :members:
+    :undoc-members:
+    :show-inheritance:
+
+ax.models.torch.botorch_modular.input_constructors.covar_modules module
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+.. automodule:: ax.models.torch.botorch_modular.input_constructors.covar_modules
+    :members:
+    :undoc-members:
+    :show-inheritance:
+
+ax.models.torch.botorch_modular.input_constructors.input_transforms module
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+.. automodule:: ax.models.torch.botorch_modular.input_constructors.input_transforms
+    :members:
+    :undoc-members:
+    :show-inheritance:
+
+ax.models.torch.botorch_modular.input_constructors.outcome_transform module
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+.. automodule:: ax.models.torch.botorch_modular.input_constructors.outcome_transform
+    :members:
+    :undoc-members:
+    :show-inheritance:
+
 ax.models.torch.cbo_lcea module
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 .. automodule:: ax.models.torch.cbo_lcea
     :members:
@@ -276,7 +256,7 @@ ax.models.torch.cbo_lcea module
     :show-inheritance:
 
 ax.models.torch.cbo_lcem module
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 .. automodule:: ax.models.torch.cbo_lcem
     :members:
@@ -284,23 +264,15 @@ ax.models.torch.cbo_lcem module
     :show-inheritance:
 
 ax.models.torch.cbo_sac module
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 .. automodule:: ax.models.torch.cbo_sac
     :members:
     :undoc-members:
     :show-inheritance:
 
-ax.models.torch.frontier_utils module
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
-.. automodule:: ax.models.torch.frontier_utils
-    :members:
-    :undoc-members:
-    :show-inheritance:
-
 ax.models.torch.fully_bayesian module
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 .. automodule:: ax.models.torch.fully_bayesian
     :members:
@@ -308,31 +280,15 @@ ax.models.torch.fully_bayesian module
     :show-inheritance:
 
 ax.models.torch.fully_bayesian_model_utils module
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 .. automodule:: ax.models.torch.fully_bayesian_model_utils
     :members:
     :undoc-members:
     :show-inheritance:
 
-ax.models.torch.posterior_mean module
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
-.. automodule:: ax.models.torch.posterior_mean
-    :members:
-    :undoc-members:
-    :show-inheritance:
-
-ax.models.torch.rembo module
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
-.. automodule:: ax.models.torch.rembo
-    :members:
-    :undoc-members:
-    :show-inheritance:
-
 ax.models.torch.utils module
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 .. automodule:: ax.models.torch.utils
     :members:

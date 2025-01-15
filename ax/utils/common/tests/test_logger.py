@@ -4,6 +4,8 @@
 # This source code is licensed under the MIT license found in the
 # LICENSE file in the root directory of this source tree.
 
+# pyre-strict
+
 import logging
 from tempfile import NamedTemporaryFile
 from unittest.mock import patch
@@ -16,10 +18,11 @@ BASE_LOGGER_NAME = f"ax.{__name__}"
 
 
 class LoggerTest(TestCase):
-    def setUp(self):
+    def setUp(self) -> None:
+        super().setUp()
         self.warning_string = "Test warning"
 
-    def testLogger(self):
+    def test_Logger(self) -> None:
         logger = get_logger(BASE_LOGGER_NAME + ".testLogger")
         # Verify it doesn't crash
         logger.warning(self.warning_string)
@@ -33,7 +36,7 @@ class LoggerTest(TestCase):
         # onto the python logger directly.
         patcher.stop()
 
-    def testLoggerWithFile(self):
+    def test_LoggerWithFile(self) -> None:
         with NamedTemporaryFile() as tf:
             logger = get_logger(BASE_LOGGER_NAME + ".testLoggerWithFile")
             logger.addHandler(build_file_handler(tf.name))
@@ -43,7 +46,7 @@ class LoggerTest(TestCase):
             self.assertIn(self.warning_string, output)
             tf.close()
 
-    def testLoggerOutputNameWithFile(self):
+    def test_LoggerOutputNameWithFile(self) -> None:
         with NamedTemporaryFile() as tf:
             logger = get_logger(BASE_LOGGER_NAME + ".testLoggerOutputNameWithFile")
             logger.addHandler(build_file_handler(tf.name))
@@ -53,3 +56,24 @@ class LoggerTest(TestCase):
             self.assertIn("my_output_name", output)
             self.assertIn(self.warning_string, output)
             tf.close()
+
+    def test_it_prepends_ax(self) -> None:
+        with self.subTest("ax"):
+            logger = get_logger("ax")
+            self.assertEqual(logger.name, "ax")
+
+        with self.subTest("ax.common"):
+            logger = get_logger("ax.common")
+            self.assertEqual(logger.name, "ax.common")
+
+        with self.subTest("axtremely"):
+            logger = get_logger("axtremely")
+            self.assertEqual(logger.name, "ax.axtremely")
+
+        with self.subTest("botorch"):
+            logger = get_logger("botorch")
+            self.assertEqual(logger.name, "ax.botorch")
+
+        with self.subTest("force_name"):
+            logger = get_logger("axtremely", force_name=True)
+            self.assertEqual(logger.name, "axtremely")

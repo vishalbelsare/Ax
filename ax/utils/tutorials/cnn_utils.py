@@ -4,8 +4,9 @@
 # This source code is licensed under the MIT license found in the
 # LICENSE file in the root directory of this source tree.
 
+# pyre-strict
+
 from itertools import accumulate
-from typing import Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -13,6 +14,7 @@ import torch.nn.functional as F
 import torch.optim as optim
 import torchvision
 import torchvision.transforms as transforms
+from torch._tensor import Tensor
 from torch.utils.data import DataLoader, Dataset, Subset
 
 
@@ -21,13 +23,13 @@ class CNN(nn.Module):
     Convolutional Neural Network.
     """
 
-    def __init__(self):
+    def __init__(self) -> None:
         super().__init__()
         self.conv1 = nn.Conv2d(1, 20, kernel_size=5, stride=1)
         self.fc1 = nn.Linear(8 * 8 * 20, 64)
         self.fc2 = nn.Linear(64, 10)
 
-    def forward(self, x):
+    def forward(self, x: Tensor) -> Tensor:
         x = F.relu(self.conv1(x))
         x = F.max_pool2d(x, 3, 3)
         x = x.view(-1, 8 * 8 * 20)
@@ -43,8 +45,8 @@ def load_mnist(
     batch_size: int = 128,
     num_workers: int = 0,
     deterministic_partitions: bool = False,
-    downsample_pct_test: Optional[float] = None,
-) -> Tuple[DataLoader, DataLoader, DataLoader]:
+    downsample_pct_test: float | None = None,
+) -> tuple[DataLoader, DataLoader, DataLoader]:
     """
     Load MNIST dataset (download if necessary) and split data into training,
         validation, and test sets.
@@ -99,8 +101,8 @@ def get_partition_data_loaders(
     batch_size: int = 128,
     num_workers: int = 0,
     deterministic_partitions: bool = False,
-    downsample_pct_test: Optional[float] = None,
-) -> Tuple[DataLoader, DataLoader, DataLoader]:
+    downsample_pct_test: float | None = None,
+) -> tuple[DataLoader, DataLoader, DataLoader]:
     """
     Helper function for partitioning training data into training and validation sets,
         downsampling data, and initializing DataLoaders for each partition.
@@ -161,8 +163,8 @@ def get_partition_data_loaders(
 
 
 def split_dataset(
-    dataset: Dataset, lengths: List[int], deterministic_partitions: bool = False
-) -> List[Dataset]:
+    dataset: Dataset, lengths: list[int], deterministic_partitions: bool = False
+) -> list[Dataset]:
     """
     Split a dataset either randomly or deterministically.
 
@@ -188,7 +190,7 @@ def split_dataset(
 def train(
     net: torch.nn.Module,
     train_loader: DataLoader,
-    parameters: Dict[str, float],
+    parameters: dict[str, float],
     dtype: torch.dtype,
     device: torch.device,
 ) -> nn.Module:

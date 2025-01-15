@@ -4,13 +4,26 @@
 # This source code is licensed under the MIT license found in the
 # LICENSE file in the root directory of this source tree.
 
+# pyre-strict
+
+from __future__ import annotations
+
 import inspect
 import pydoc
+from collections.abc import Callable
 from types import FunctionType
-from typing import Any, Callable, Dict, List, Optional, Type
+from typing import Any, TypeVar, Union
+
+
+T = TypeVar("T")
+TDecoderRegistry = dict[str, Union[type[T], Callable[..., T]]]
+# pyre-fixme[33]: `TClassDecoderRegistry` cannot alias to a type containing `Any`.
+TClassDecoderRegistry = dict[str, Callable[[dict[str, Any]], Any]]
 
 
 # https://stackoverflow.com/a/39235373
+# pyre-fixme[3]: Return annotation cannot be `Any`.
+# pyre-fixme[2]: Parameter annotation cannot be `Any`.
 def named_tuple_to_dict(data: Any) -> Any:
     """Recursively convert NamedTuples to dictionaries."""
     if isinstance(data, dict):
@@ -28,6 +41,7 @@ def named_tuple_to_dict(data: Any) -> Any:
 
 
 # https://stackoverflow.com/a/2166841
+# pyre-fixme[2]: Parameter annotation cannot be `Any`.
 def _is_named_tuple(x: Any) -> bool:
     """Return True if x is an instance of NamedTuple."""
     t = type(x)
@@ -37,7 +51,7 @@ def _is_named_tuple(x: Any) -> bool:
     f = getattr(t, "_fields", None)
     if not isinstance(f, tuple):
         return False  # pragma nocover
-    return all(type(n) == str for n in f)
+    return all(isinstance(n, str) for n in f)
 
 
 def callable_to_reference(callable: Callable) -> str:
@@ -61,29 +75,33 @@ def callable_from_reference(path: str) -> Callable:
 
 
 def serialize_init_args(
-    object: Any, exclude_fields: Optional[List[str]] = None
-) -> Dict[str, Any]:
+    # pyre-fixme[2]: Parameter annotation cannot be `Any`.
+    obj: Any,
+    exclude_fields: list[str] | None = None,
+) -> dict[str, Any]:
     """Given an object, return a dictionary of the arguments that are
     needed by its constructor.
     """
     properties = {}
     exclude_args = ["self", "args", "kwargs"] + (exclude_fields or [])
-    signature = inspect.signature(object.__class__.__init__)
+    signature = inspect.signature(obj.__class__.__init__)
     for arg in signature.parameters:
         if arg in exclude_args:
             continue
         try:
-            value = getattr(object, arg)
+            value = getattr(obj, arg)
         except AttributeError:
             raise AttributeError(
-                f"{object.__class__} is missing a value for {arg}, "
+                f"{obj.__class__} is missing a value for {arg}, "
                 f"which is needed by its constructor."
             )
         properties[arg] = value
     return properties
 
 
-def extract_init_args(args: Dict[str, Any], class_: Type) -> Dict[str, Any]:
+# pyre-fixme[24]: Generic type `type` expects 1 type parameter, use `typing.Type` to
+#  avoid runtime subscripting errors.
+def extract_init_args(args: dict[str, Any], class_: type) -> dict[str, Any]:
     """Given a dictionary, extract the arguments required for the
     given class's constructor.
     """
@@ -104,6 +122,45 @@ def extract_init_args(args: Dict[str, Any], class_: Type) -> Dict[str, Any]:
                 )
             else:
                 # Constructor will use default value
-                continue  # pragma: no cover
+                continue
         init_args[arg] = value
     return init_args
+
+
+class SerializationMixin:
+    """Base class for Ax objects that define their JSON serialization and
+    deserialization logic at the class level, e.g. most commonly ``Runner``
+    and ``Metric`` subclasses.
+
+    NOTE: Using this class for Ax objects that receive other Ax objects
+    as inputs, is recommended only iff the parent object (that would be
+    inheriting from this base class) is not enrolled into
+    CORE_ENCODER/DECODER_REGISTRY. Inheriting from this mixin with an Ax
+    object that is in CORE_ENCODER/DECODER_REGISTRY, will result in a
+    circular dependency, so such classes should inplement their encoding
+    and decoding logic within the `json_store` module and not on the classes.
+
+    For example, TransitionCriterion take TrialStatus as inputs and are defined
+    on the CORE_ENCODER/DECODER_REGISTRY, so TransitionCriterion should not inherit
+    from SerializationMixin and should define custom encoding/decoding logic within
+    the json_store module.
+    """
+
+    @classmethod
+    def serialize_init_args(cls, obj: SerializationMixin) -> dict[str, Any]:
+        """Serialize the properties needed to initialize the object.
+        Used for storage.
+        """
+        return serialize_init_args(obj=obj)
+
+    @classmethod
+    def deserialize_init_args(
+        cls,
+        args: dict[str, Any],
+        decoder_registry: TDecoderRegistry | None = None,
+        class_decoder_registry: TClassDecoderRegistry | None = None,
+    ) -> dict[str, Any]:
+        """Given a dictionary, deserialize the properties needed to initialize the
+        object. Used for storage.
+        """
+        return extract_init_args(args=args, class_=cls)

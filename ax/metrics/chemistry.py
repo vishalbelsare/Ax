@@ -4,6 +4,8 @@
 # This source code is licensed under the MIT license found in the
 # LICENSE file in the root directory of this source tree.
 
+# pyre-strict
+
 """
 Classes for optimizing yields from chemical reactions.
 
@@ -34,26 +36,29 @@ from dataclasses import dataclass
 from enum import Enum
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import Any
 from zipfile import ZipFile
 
 import pandas as pd
 from ax.core.base_trial import BaseTrial
 from ax.core.data import Data
-from ax.core.metric import Metric
+from ax.core.metric import Metric, MetricFetchE, MetricFetchResult
 from ax.core.types import TParameterization, TParamValue
-from ax.utils.common.typeutils import not_none
+from ax.utils.common.result import Err, Ok
+from pyre_extensions import none_throws
 
 
 class ChemistryProblemType(Enum):
+    # pyre-fixme[35]: Target cannot be annotated.
     SUZUKI: str = "suzuki"
+    # pyre-fixme[35]: Target cannot be annotated.
     DIRECT_ARYLATION: str = "direct_arylation"
 
 
 @dataclass(frozen=True)
 class ChemistryData:
-    param_names: List[str]
-    objective_dict: Dict[Tuple[TParamValue, ...], float]
+    param_names: list[str]
+    objective_dict: dict[tuple[TParamValue, ...], float]
 
     def evaluate(self, params: TParameterization) -> float:
         k = tuple(params[pname] for pname in self.param_names)
@@ -82,7 +87,7 @@ class ChemistryMetric(Metric):
     Args:
         name: The name of the metric.
         noiseless: If True, consider observations noiseless, otherwise
-            assume unknown Gaussian observation noise.
+        sume unknown Gaussian observation noise.
         problem_type: The problem type.
 
     Attributes:
@@ -107,25 +112,31 @@ class ChemistryMetric(Metric):
             name=self._name,
             noiseless=self.noiseless,
             problem_type=self.problem_type,
-            lower_is_better=not_none(self.lower_is_better),
+            lower_is_better=none_throws(self.lower_is_better),
         )
 
-    def fetch_trial_data(self, trial: BaseTrial, **kwargs: Any) -> Data:
-        noise_sd = 0.0 if self.noiseless else float("nan")
-        data = _get_data(self.problem_type)
-        arm_names = []
-        mean = []
-        for name, arm in trial.arms_by_name.items():
-            arm_names.append(name)
-            val = data.evaluate(params=arm.parameters)
-            mean.append(val)
-        df = pd.DataFrame(
-            {
-                "arm_name": arm_names,
-                "metric_name": self.name,
-                "mean": mean,
-                "sem": noise_sd,
-                "trial_index": trial.index,
-            }
-        )
-        return Data(df=df)
+    def fetch_trial_data(self, trial: BaseTrial, **kwargs: Any) -> MetricFetchResult:
+        try:
+            noise_sd = 0.0 if self.noiseless else float("nan")
+            data = _get_data(self.problem_type)
+            arm_names = []
+            mean = []
+            for name, arm in trial.arms_by_name.items():
+                arm_names.append(name)
+                val = data.evaluate(params=arm.parameters)
+                mean.append(val)
+            df = pd.DataFrame(
+                {
+                    "arm_name": arm_names,
+                    "metric_name": self.name,
+                    "mean": mean,
+                    "sem": noise_sd,
+                    "trial_index": trial.index,
+                }
+            )
+            return Ok(value=Data(df=df))
+
+        except Exception as e:
+            return Err(
+                MetricFetchE(message=f"Failed to fetch {self.name}", exception=e)
+            )

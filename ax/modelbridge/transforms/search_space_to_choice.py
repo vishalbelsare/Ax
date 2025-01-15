@@ -4,10 +4,12 @@
 # This source code is licensed under the MIT license found in the
 # LICENSE file in the root directory of this source tree.
 
-from typing import List, Optional, TYPE_CHECKING
+# pyre-strict
+
+from typing import Optional, TYPE_CHECKING
 
 from ax.core.arm import Arm
-from ax.core.observation import ObservationData, ObservationFeatures
+from ax.core.observation import Observation, ObservationFeatures
 from ax.core.parameter import ChoiceParameter, FixedParameter, ParameterType
 from ax.core.search_space import RobustSearchSpace, SearchSpace
 from ax.exceptions.core import UnsupportedError
@@ -17,7 +19,7 @@ from ax.utils.common.typeutils import checked_cast
 
 if TYPE_CHECKING:
     # import as module to make sphinx-autodoc-typehints happy
-    from ax import modelbridge as modelbridge_module  # noqa F401  # pragma: no cover
+    from ax import modelbridge as modelbridge_module  # noqa F401
 
 
 class SearchSpaceToChoice(Transform):
@@ -34,16 +36,16 @@ class SearchSpaceToChoice(Transform):
 
     def __init__(
         self,
-        search_space: SearchSpace,
-        observation_features: List[ObservationFeatures],
-        observation_data: List[ObservationData],
+        search_space: SearchSpace | None = None,
+        observations: list[Observation] | None = None,
         modelbridge: Optional["modelbridge_module.base.ModelBridge"] = None,
-        config: Optional[TConfig] = None,
+        config: TConfig | None = None,
     ) -> None:
+        assert search_space is not None, "SearchSpaceToChoice requires search space"
+        assert observations is not None, "SeachSpaceToChoice requires observations"
         super().__init__(
             search_space=search_space,
-            observation_features=observation_features,
-            observation_data=observation_data,
+            observations=observations,
             config=config,
         )
         if any(p.is_fidelity for p in search_space.parameters.values()):
@@ -56,9 +58,10 @@ class SearchSpaceToChoice(Transform):
                 "SearchSpaceToChoice transform is not supported for RobustSearchSpace."
             )
         self.parameter_name = "arms"
+        # pyre-fixme[4]: Attribute must be annotated.
         self.signature_to_parameterization = {
-            Arm(parameters=obsf.parameters).signature: obsf.parameters
-            for obsf in observation_features
+            Arm(parameters=obs.features.parameters).signature: obs.features.parameters
+            for obs in observations
         }
 
     def _transform_search_space(self, search_space: SearchSpace) -> SearchSpace:
@@ -80,18 +83,22 @@ class SearchSpaceToChoice(Transform):
         return SearchSpace(parameters=[parameter])
 
     def transform_observation_features(
-        self, observation_features: List[ObservationFeatures]
-    ) -> List[ObservationFeatures]:
+        self, observation_features: list[ObservationFeatures]
+    ) -> list[ObservationFeatures]:
         for obsf in observation_features:
-            obsf.parameters = {
-                self.parameter_name: Arm(parameters=obsf.parameters).signature
-            }
+            # if obsf.parameters is not an empty dict
+            if len(obsf.parameters) != 0:
+                obsf.parameters = {
+                    self.parameter_name: Arm(parameters=obsf.parameters).signature
+                }
         return observation_features
 
     def untransform_observation_features(
-        self, observation_features: List[ObservationFeatures]
-    ) -> List[ObservationFeatures]:
+        self, observation_features: list[ObservationFeatures]
+    ) -> list[ObservationFeatures]:
         for obsf in observation_features:
-            signature = obsf.parameters[self.parameter_name]
-            obsf.parameters = self.signature_to_parameterization[signature]
+            # Do not untransform empty dict as it wasn't transformed in the first place
+            if len(obsf.parameters) != 0:
+                signature = obsf.parameters[self.parameter_name]
+                obsf.parameters = self.signature_to_parameterization[signature]
         return observation_features

@@ -4,6 +4,8 @@
 # This source code is licensed under the MIT license found in the
 # LICENSE file in the root directory of this source tree.
 
+# pyre-strict
+
 from contextlib import ExitStack
 from enum import Enum
 from math import sqrt
@@ -19,21 +21,26 @@ from sklearn.ensemble import RandomForestClassifier
 
 
 class DummyEnum(Enum):
-    DUMMY: str = "dummy"
+    _value_: str
+    DUMMY = "dummy"
 
 
 class SklearnMetricTest(TestCase):
-    def testSklearnMetric(self):
+    def test_SklearnMetric(self) -> None:
         # test not implemented dataset
         with self.assertRaises(NotImplementedError):
             SklearnMetric(
                 name="test_metric",
+                # pyre-fixme[6]: For 2nd param expected `SklearnDataset` but got
+                #  `DummyEnum`.
                 dataset=DummyEnum.DUMMY,
             )
         # test not implemented model type
         with self.assertRaises(NotImplementedError):
             SklearnMetric(
                 name="test_metric",
+                # pyre-fixme[6]: For 2nd param expected `SklearnModelType` but got
+                #  `DummyEnum`.
                 model_type=DummyEnum.DUMMY,
             )
         # basic test
@@ -72,7 +79,7 @@ class SklearnMetricTest(TestCase):
             trial._generator_run = GeneratorRun(
                 arms=[Arm(name="0_0", parameters=params)]
             )
-            df = metric.fetch_trial_data(trial).df
+            df = metric.fetch_trial_data(trial).unwrap().df
             mock_load_digits.assert_called_once()
             mock_cv.assert_called_once()
             cargs, ckwargs = mock_cv.call_args
@@ -92,13 +99,13 @@ class SklearnMetricTest(TestCase):
 
             # test observed noise
             metric = SklearnMetric(name="test_metric", observed_noise=True)
-            df = metric.fetch_trial_data(trial).df
+            df = metric.fetch_trial_data(trial).unwrap().df
             self.assertEqual(
                 df["sem"].values[0], cv_scores.std() / sqrt(cv_scores.shape[0])
             )
             # test num_folds
             mock_cv.reset_mock()
             metric = SklearnMetric(name="test_metric", num_folds=10)
-            df = metric.fetch_trial_data(trial).df
+            df = metric.fetch_trial_data(trial).unwrap().df
             _, ckwargs = mock_cv.call_args
             self.assertEqual(ckwargs["cv"], 10)

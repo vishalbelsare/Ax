@@ -1,12 +1,12 @@
 {
   "API Comparison": [
     {
-      "id": "gpei_hartmann_loop",
-      "title": "Loop API"
+      "id": "gpei_hartmann_service",
+      "title": "[RECOMMENDED] Service API"
     },
     {
-      "id": "gpei_hartmann_service",
-      "title": "Service API"
+      "id": "gpei_hartmann_loop",
+      "title": "Loop API"
     },
     {
       "id": "gpei_hartmann_developer",
@@ -33,12 +33,12 @@
   ],
   "Bayesian Optimization": [
     {
-      "id": "tune_cnn",
+      "id": "tune_cnn_service",
       "title": "Hyperparameter Optimization for PyTorch"
     },
     {
-      "id": "raytune_pytorch_cnn",
-      "title": "Hyperparameter Optimization via Raytune"
+      "id": "submitit",
+      "title": "Hyperparameter Optimization on SLURM via SubmitIt"
     },
     {
       "id": "multi_task",
@@ -55,6 +55,19 @@
     {
       "id": "saasbo_nehvi",
       "title": "Fully Bayesian, High-Dimensional, Multi-Objective Optimization"
+    },
+    {
+      "id": "sebo",
+      "title": "Sparsity Exploration Bayesian Optimization (SEBO)"
+    },
+    {
+      "dir": "early_stopping",
+      "id": "early_stopping",
+      "title": "Trial-Level Early Stopping"
+    },
+    {
+      "id": "gss",
+      "title": "Global Stopping (Experiment-Level Early Stopping)"
     }
   ],
   "Field Experiments": [
@@ -66,6 +79,12 @@
       "dir": "human_in_the_loop",
       "id": "human_in_the_loop",
       "title": "Human-in-the-Loop Optimization"
+    }
+  ],
+  "Integrating External Strategies": [
+    {
+      "id": "external_generation_node",
+      "title": "RandomForest with ExternalGenerationNode"
     }
   ]
 }

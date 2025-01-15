@@ -4,10 +4,12 @@
 # This source code is licensed under the MIT license found in the
 # LICENSE file in the root directory of this source tree.
 
-from typing import Any, List
+# pyre-strict
+
+from typing import Any
 
 from ax.core.base_trial import BaseTrial
-from ax.core.map_data import MapData
+from ax.core.map_metric import MapMetricFetchResult
 from ax.metrics.noisy_function_map import NoisyFunctionMapMetric
 
 
@@ -17,7 +19,7 @@ class BackendSimulatorTimestampMapMetric(NoisyFunctionMapMetric):
 
     def fetch_trial_data(
         self, trial: BaseTrial, noisy: bool = True, **kwargs: Any
-    ) -> MapData:
+    ) -> MapMetricFetchResult:
         """Fetch data for one trial."""
         backend_simulator = trial.experiment.runner.simulator  # pyre-ignore[16]
         sim_trial = backend_simulator.get_sim_trial_by_index(trial.index)
@@ -34,7 +36,7 @@ class BackendSimulatorTimestampMapMetric(NoisyFunctionMapMetric):
             self, trial=trial, noisy=noisy, **kwargs, **timestamp_kwargs
         )
 
-    def convert_to_timestamps(self, start_time: float, end_time: float) -> List[float]:
+    def convert_to_timestamps(self, start_time: float, end_time: float) -> list[float]:
         """Given a starting and current time, get the list of intermediate
         timestamps at which we have observations."""
         raise NotImplementedError

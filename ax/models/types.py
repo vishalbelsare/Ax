@@ -4,14 +4,27 @@
 # This source code is licensed under the MIT license found in the
 # LICENSE file in the root directory of this source tree.
 
-from typing import Any, Dict, Union
+# pyre-strict
+
+from typing import Any, Union
 
 from ax.core.optimization_config import OptimizationConfig
+from ax.models.winsorization_config import WinsorizationConfig
 from botorch.acquisition import AcquisitionFunction
 
-TConfig = Dict[
+# pyre-ignore [33]: `TConfig` cannot alias to a type containing `Any`.
+TConfig = dict[
     str,
     Union[
-        int, float, str, AcquisitionFunction, Dict[str, Any], OptimizationConfig, None
+        int,
+        float,
+        str,
+        AcquisitionFunction,
+        list[str],
+        dict[int, Any],
+        dict[str, Any],
+        OptimizationConfig,
+        WinsorizationConfig,
+        None,
     ],
 ]

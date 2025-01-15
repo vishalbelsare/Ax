@@ -4,6 +4,8 @@
 # This source code is licensed under the MIT license found in the
 # LICENSE file in the root directory of this source tree.
 
+# pyre-strict
+
 from unittest import mock
 
 from ax.core.base_trial import BaseTrial
@@ -13,28 +15,30 @@ from ax.utils.testing.core_stubs import get_batch_trial, get_trial
 
 
 class DummyRunner(Runner):
+    # pyre-fixme[3]: Return type must be annotated.
     def run(self, trial: BaseTrial):
         return {"metadatum": f"value_for_trial_{trial.index}"}
 
 
 class RunnerTest(TestCase):
-    def setUp(self):
+    def setUp(self) -> None:
+        super().setUp()
         self.dummy_runner = DummyRunner()
         self.trials = [get_trial(), get_batch_trial()]
 
-    def test_base_runner_staging_required(self):
+    def test_base_runner_staging_required(self) -> None:
         self.assertFalse(self.dummy_runner.staging_required)
 
-    def test_base_runner_stop(self):
+    def test_base_runner_stop(self) -> None:
         with self.assertRaises(NotImplementedError):
             self.dummy_runner.stop(trial=mock.Mock(), reason="")
 
-    def test_base_runner_clone(self):
+    def test_base_runner_clone(self) -> None:
         runner_clone = self.dummy_runner.clone()
         self.assertIsInstance(runner_clone, DummyRunner)
         self.assertEqual(runner_clone, self.dummy_runner)
 
-    def test_base_runner_run_multiple(self):
+    def test_base_runner_run_multiple(self) -> None:
         metadata = self.dummy_runner.run_multiple(trials=self.trials)
         self.assertEqual(
             metadata,
@@ -42,9 +46,16 @@ class RunnerTest(TestCase):
         )
         self.assertEqual({}, self.dummy_runner.run_multiple(trials=[]))
 
-    def test_base_runner_poll_trial_status(self):
+    def test_base_runner_poll_trial_status(self) -> None:
         with self.assertRaises(NotImplementedError):
             self.dummy_runner.poll_trial_status(trials=self.trials)
 
-    def test_poll_available_capacity(self):
+    def test_base_runner_poll_exception(self) -> None:
+        with self.assertRaises(NotImplementedError):
+            self.dummy_runner.poll_exception(trial=self.trials[0])
+
+    def test_poll_available_capacity(self) -> None:
         self.assertEqual(self.dummy_runner.poll_available_capacity(), -1)
+
+    def test_run_metadata_report_keys(self) -> None:
+        self.assertEqual(self.dummy_runner.run_metadata_report_keys, [])

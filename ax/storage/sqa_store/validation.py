@@ -4,7 +4,11 @@
 # This source code is licensed under the MIT license found in the
 # LICENSE file in the root directory of this source tree.
 
-from typing import Any, Callable, List, TypeVar
+# pyre-strict
+
+from collections.abc import Callable
+from logging import Logger
+from typing import Any, TypeVar
 
 from ax.storage.sqa_store.db import SQABase
 from ax.storage.sqa_store.reduced_state import GR_LARGE_MODEL_ATTRS
@@ -23,21 +27,23 @@ from sqlalchemy.orm.attributes import InstrumentedAttribute
 from sqlalchemy.orm.base import NO_VALUE
 from sqlalchemy.orm.mapper import Mapper
 
-
 T = TypeVar("T")
 
 
-logger = get_logger(__name__)
+logger: Logger = get_logger(__name__)
 
 
 def listens_for_multiple(
-    targets: List[InstrumentedAttribute], identifier: str, *args: Any, **kwargs: Any
+    targets: list[InstrumentedAttribute],
+    identifier: str,
+    *args: Any,
+    **kwargs: Any,
 ) -> Callable:
     """Analogue of SQLAlchemy `listen_for`, but applies the same listening handler
     function to multiple instrumented attributes.
     """
 
-    def wrapper(fn: Callable):
+    def wrapper(fn: Callable) -> Callable:
         for target in targets:
             event.listen(target, identifier, fn, *args, **kwargs)
         return fn
@@ -45,7 +51,8 @@ def listens_for_multiple(
     return wrapper
 
 
-def consistency_exactly_one(instance: SQABase, exactly_one_fields: List[str]) -> Any:
+# pyre-fixme[3]: Return annotation cannot be `Any`.
+def consistency_exactly_one(instance: SQABase, exactly_one_fields: list[str]) -> Any:
     """Ensure that exactly one of `exactly_one_fields` has a value set."""
     values = [getattr(instance, field) is not None for field in exactly_one_fields]
     if sum(values) != 1:

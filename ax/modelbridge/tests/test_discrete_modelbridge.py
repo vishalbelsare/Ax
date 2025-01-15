@@ -4,7 +4,10 @@
 # This source code is licensed under the MIT license found in the
 # LICENSE file in the root directory of this source tree.
 
+# pyre-strict
+
 from unittest import mock
+from unittest.mock import Mock
 
 import numpy as np
 from ax.core.metric import Metric
@@ -19,13 +22,15 @@ from ax.core.parameter import (
     RangeParameter,
 )
 from ax.core.search_space import SearchSpace
+from ax.exceptions.core import UserInputError
 from ax.modelbridge.discrete import _get_parameter_values, DiscreteModelBridge
 from ax.models.discrete_base import DiscreteModel
 from ax.utils.common.testutils import TestCase
 
 
 class DiscreteModelBridgeTest(TestCase):
-    def setUp(self):
+    def setUp(self) -> None:
+        super().setUp()
         self.parameters = [
             ChoiceParameter("x", ParameterType.FLOAT, values=[0, 1]),
             ChoiceParameter("y", ParameterType.STRING, values=["foo", "bar"]),
@@ -71,13 +76,12 @@ class DiscreteModelBridgeTest(TestCase):
     @mock.patch(
         "ax.modelbridge.discrete.DiscreteModelBridge.__init__", return_value=None
     )
-    def testFit(self, mock_init):
+    def test_fit(self, mock_init: Mock) -> None:
+        # pyre-fixme[20]: Argument `model` expected.
         ma = DiscreteModelBridge()
         ma._training_data = self.observations
         model = mock.create_autospec(DiscreteModel, instance=True)
-        ma._fit(
-            model, self.search_space, self.observation_features, self.observation_data
-        )
+        ma._fit(model, self.search_space, self.observations)
         self.assertEqual(ma.parameters, ["x", "y", "z"])
         self.assertEqual(sorted(ma.outcomes), ["a", "b"])
         Xs = {
@@ -96,20 +100,17 @@ class DiscreteModelBridgeTest(TestCase):
             self.assertEqual(v, Yvars[ma.outcomes[i]])
         self.assertEqual(model_fit_args["parameter_values"], parameter_values)
 
-        sq_feat = ObservationFeatures({})
-        sq_data = self.observation_data[0]
+        sq_obs = Observation(
+            features=ObservationFeatures({}), data=self.observation_data[0]
+        )
         with self.assertRaises(ValueError):
-            ma._fit(
-                model,
-                self.search_space,
-                self.observation_features + [sq_feat],
-                self.observation_data + [sq_data],
-            )
+            ma._fit(model, self.search_space, self.observations + [sq_obs])
 
     @mock.patch(
         "ax.modelbridge.discrete.DiscreteModelBridge.__init__", return_value=None
     )
-    def testPredict(self, mock_init):
+    def test_predict(self, mock_init: Mock) -> None:
+        # pyre-fixme[20]: Argument `model` expected.
         ma = DiscreteModelBridge()
         model = mock.MagicMock(DiscreteModel, autospec=True, instance=True)
         model.predict.return_value = (
@@ -130,7 +131,7 @@ class DiscreteModelBridgeTest(TestCase):
     @mock.patch(
         "ax.modelbridge.discrete.DiscreteModelBridge.__init__", return_value=None
     )
-    def testGen(self, mock_init):
+    def test_gen(self, mock_init: Mock) -> None:
         # Test with constraints
         optimization_config = OptimizationConfig(
             objective=Objective(Metric("a"), minimize=True),
@@ -138,18 +139,32 @@ class DiscreteModelBridgeTest(TestCase):
                 OutcomeConstraint(Metric("b"), ComparisonOp.GEQ, 2, False)
             ],
         )
+        # pyre-fixme[20]: Argument `model` expected.
         ma = DiscreteModelBridge()
+        # Test validation.
+        with self.assertRaisesRegex(UserInputError, "positive integer or -1."):
+            ma._validate_gen_inputs(n=0)
+        ma._validate_gen_inputs(n=-1)
+        # Test rest of gen.
         model = mock.MagicMock(DiscreteModel, autospec=True, instance=True)
-        model.gen.return_value = ([[0.0, 2.0, 3.0], [1.0, 1.0, 3.0]], [1.0, 2.0], {})
+        best_x = [0.0, 2.0, 1.0]
+        model.gen.return_value = (
+            [[0.0, 2.0, 3.0], [1.0, 1.0, 3.0]],
+            [1.0, 2.0],
+            {"best_x": best_x},
+        )
         ma.model = model
         ma.parameters = ["x", "y", "z"]
         ma.outcomes = ["a", "b"]
-        observation_features, weights, best_observation, _ = ma._gen(
+        gen_results = ma._gen(
             n=3,
             search_space=self.search_space,
             optimization_config=optimization_config,
             pending_observations=self.pending_observations,
             fixed_features=ObservationFeatures({}),
+            # pyre-fixme[6]: For 6th param expected `Optional[Dict[str, Union[None,
+            #  Dict[str, typing.Any], OptimizationConfig, AcquisitionFunction, float,
+            #  int, str]]]` but got `Dict[str, str]`.
             model_gen_options=self.model_gen_options,
         )
         gen_args = model.gen.mock_calls[0][2]
@@ -170,12 +185,18 @@ class DiscreteModelBridgeTest(TestCase):
         self.assertEqual(gen_args["pending_observations"][1], [[0, "foo", True]])
         self.assertEqual(gen_args["model_gen_options"], {"option": "yes"})
         self.assertEqual(
-            observation_features[0].parameters, {"x": 0.0, "y": 2.0, "z": 3.0}
+            gen_results.observation_features[0].parameters,
+            {"x": 0.0, "y": 2.0, "z": 3.0},
         )
         self.assertEqual(
-            observation_features[1].parameters, {"x": 1.0, "y": 1.0, "z": 3.0}
+            gen_results.observation_features[1].parameters,
+            {"x": 1.0, "y": 1.0, "z": 3.0},
         )
-        self.assertEqual(weights, [1.0, 2.0])
+        self.assertEqual(gen_results.weights, [1.0, 2.0])
+        self.assertEqual(
+            gen_results.best_observation_features,
+            ObservationFeatures(parameters=dict(zip(ma.parameters, best_x))),
+        )
 
         # Test with no constraints, no fixed feature, no pending observations
         search_space = SearchSpace(self.parameters[:2])
@@ -214,7 +235,8 @@ class DiscreteModelBridgeTest(TestCase):
     @mock.patch(
         "ax.modelbridge.discrete.DiscreteModelBridge.__init__", return_value=None
     )
-    def testCrossValidate(self, mock_init):
+    def test_cross_validate(self, mock_init: Mock) -> None:
+        # pyre-fixme[20]: Argument `model` expected.
         ma = DiscreteModelBridge()
         model = mock.MagicMock(DiscreteModel, autospec=True, instance=True)
         model.cross_validate.return_value = (
@@ -228,8 +250,7 @@ class DiscreteModelBridgeTest(TestCase):
         ma.outcomes = ["a", "b"]
         observation_data = ma._cross_validate(
             search_space=self.search_space,
-            obs_feats=self.observation_features,
-            obs_data=self.observation_data,
+            cv_training_data=self.observations,
             cv_test_points=self.observation_features,
         )
         Xs = [
@@ -252,7 +273,7 @@ class DiscreteModelBridgeTest(TestCase):
         for i, od in enumerate(observation_data):
             self.assertEqual(od, self.observation_data[i])
 
-    def testGetParameterValues(self):
+    def test_get_parameter_values(self) -> None:
         parameter_values = _get_parameter_values(self.search_space, ["x", "y", "z"])
         self.assertEqual(parameter_values, [[0.0, 1.0], ["foo", "bar"], [True]])
         search_space = SearchSpace(self.parameters)

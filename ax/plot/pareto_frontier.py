@@ -4,10 +4,14 @@
 # This source code is licensed under the MIT license found in the
 # LICENSE file in the root directory of this source tree.
 
+# pyre-strict
+
 import warnings
-from typing import Dict, List, Optional, Tuple, Union
+from collections.abc import Iterable
 
 import numpy as np
+import numpy.typing as npt
+import pandas as pd
 import plotly.graph_objs as go
 from ax.core.experiment import Experiment
 from ax.core.objective import MultiObjective
@@ -21,7 +25,10 @@ from ax.plot.base import AxPlotConfig, AxPlotTypes, CI_OPACITY, DECIMALS
 from ax.plot.color import COLORS, DISCRETE_COLOR_SCALE, rgba
 from ax.plot.helper import _format_CI, _format_dict, extend_range
 from ax.plot.pareto_utils import ParetoFrontierResults
-from ax.utils.common.typeutils import checked_cast, not_none
+from ax.service.utils.best_point_mixin import BestPointMixin
+from ax.utils.common.typeutils import checked_cast
+from plotly import express as px
+from pyre_extensions import none_throws
 from scipy.stats import norm
 
 
@@ -30,7 +37,7 @@ VALID_CONSTRAINT_OP_NAMES = {"GEQ", "LEQ"}
 
 
 def _make_label(
-    mean: float, sem: float, name: str, is_relative: bool, Z: Optional[float]
+    mean: float, sem: float, name: str, is_relative: bool, Z: float | None
 ) -> str:
     estimate = str(round(mean, DECIMALS))
     perc = "%" if is_relative else ""
@@ -42,25 +49,53 @@ def _make_label(
     return f"{name}: {estimate}{perc} {ci}<br>"
 
 
-def _filter_outliers(Y: np.ndarray, m: float = 2.0) -> np.ndarray:
+def _filter_outliers(Y: npt.NDArray, m: float = 2.0) -> npt.NDArray:
     std_filter = abs(Y - np.median(Y, axis=0)) < m * np.std(Y, axis=0)
     return Y[np.all(abs(std_filter), axis=1)]
 
 
+def scatter_plot_with_hypervolume_trace_plotly(experiment: Experiment) -> go.Figure:
+    """
+    Plots the hypervolume of the Pareto frontier after each iteration with the same
+    color scheme as the Pareto frontier plot. This is useful for understanding if the
+    frontier is expanding or if the optimization has stalled out.
+
+    Arguments:
+        experiment: MOO experiment to calculate the hypervolume trace from
+    """
+    hypervolume_trace = BestPointMixin._get_trace(experiment=experiment)
+
+    df = pd.DataFrame(
+        {
+            "hypervolume": hypervolume_trace,
+            "trial_index": [*range(len(hypervolume_trace))],
+        }
+    )
+
+    return px.line(
+        data_frame=df,
+        x="trial_index",
+        y="hypervolume",
+        title="Pareto Frontier Hypervolume Trace",
+        markers=True,
+    )
+
+
 def scatter_plot_with_pareto_frontier_plotly(
-    Y: np.ndarray,
-    Y_pareto: Optional[np.ndarray],
-    metric_x: Optional[str],
-    metric_y: Optional[str],
-    reference_point: Optional[Tuple[float, float]],
-    minimize: Optional[Union[bool, Tuple[bool, bool]]] = True,
+    Y: npt.NDArray,
+    Y_pareto: npt.NDArray | None,
+    metric_x: str | None,
+    metric_y: str | None,
+    reference_point: tuple[float, float] | None,
+    minimize: bool | tuple[bool, bool] | None = True,
+    hovertext: Iterable[str] | None = None,
 ) -> go.Figure:
     """Plots a scatter of all points in ``Y`` for ``metric_x`` and ``metric_y``
     with a reference point and Pareto frontier from ``Y_pareto``.
 
     Points in the scatter are colored in a gradient representing their trial index,
     with metric_x on x-axis and metric_y on y-axis. Reference point is represented
-    as a star and Pareto frontier –– as a line. The frontier connects to the reference
+    as a star and Pareto frontier –– as a line. The frontier connects to the reference
     point via projection lines.
 
     NOTE: Both metrics should have the same minimization setting, passed as `minimize`.
@@ -98,11 +133,17 @@ def scatter_plot_with_pareto_frontier_plotly(
                 },
             },
             name="Experimental points",
+            hovertemplate="%{text}",
+            text=hovertext,
         )
     ]
     # No Pareto frontier is drawn if none is provided, or if the frontier consists of
     # a single point and no reference points are provided.
-    if Y_pareto is None or (len(Y_pareto) == 1 and reference_point is None):
+    if (
+        Y_pareto is None
+        or len(Y_pareto) == 0
+        or (len(Y_pareto) == 1 and reference_point is None)
+    ):
         # `Y_pareto` input was not specified
         range_x = extend_range(lower=min(Y[:, 0]), upper=max(Y[:, 0]))
         range_y = extend_range(lower=min(Y[:, 1]), upper=max(Y[:, 1]))
@@ -199,14 +240,16 @@ def scatter_plot_with_pareto_frontier_plotly(
 
 
 def scatter_plot_with_pareto_frontier(
-    Y: np.ndarray,
-    Y_pareto: np.ndarray,
+    Y: npt.NDArray,
+    Y_pareto: npt.NDArray,
     metric_x: str,
     metric_y: str,
-    reference_point: Tuple[float, float],
+    reference_point: tuple[float, float],
     minimize: bool = True,
 ) -> AxPlotConfig:
     return AxPlotConfig(
+        # pyre-fixme[6]: For 1st argument expected `Dict[str, typing.Any]` but got
+        #  `Figure`.
         data=scatter_plot_with_pareto_frontier_plotly(
             Y=Y,
             Y_pareto=Y_pareto,
@@ -222,7 +265,7 @@ def _get_single_pareto_trace(
     frontier: ParetoFrontierResults,
     CI_level: float,
     legend_label: str = "mean",
-    trace_color: Tuple[int] = COLORS.STEELBLUE.value,
+    trace_color: tuple[int] = COLORS.STEELBLUE.value,
     show_parameterization_on_hover: bool = True,
 ) -> go.Scatter:
     primary_means = frontier.means[frontier.primary_metric]
@@ -237,7 +280,7 @@ def _get_single_pareto_trace(
         arm_names = [f"Arm {name}" for name in frontier.arm_names]
 
     if CI_level is not None:
-        Z = 0.5 * norm.ppf(1 - (1 - CI_level) / 2)
+        Z = norm.ppf(1 - (1 - CI_level) / 2)
     else:
         Z = None
 
@@ -371,11 +414,12 @@ def plot_pareto_frontier(
     )
 
     fig = go.Figure(data=[trace], layout=layout)
+    # pyre-fixme[6]: For 1st argument expected `Dict[str, typing.Any]` but got `Figure`.
     return AxPlotConfig(data=fig, plot_type=AxPlotTypes.GENERIC)
 
 
 def plot_multiple_pareto_frontiers(
-    frontiers: Dict[str, ParetoFrontierResults],
+    frontiers: dict[str, ParetoFrontierResults],
     CI_level: float = DEFAULT_CI_LEVEL,
     show_parameterization_on_hover: bool = True,
 ) -> AxPlotConfig:
@@ -479,17 +523,29 @@ def plot_multiple_pareto_frontiers(
     )
 
     fig = go.Figure(data=traces, layout=layout)
+    # pyre-fixme[6]: For 1st argument expected `Dict[str, typing.Any]` but got `Figure`.
     return AxPlotConfig(data=fig, plot_type=AxPlotTypes.GENERIC)
 
 
 def interact_pareto_frontier(
-    frontier_list: List[ParetoFrontierResults],
+    frontier_list: list[ParetoFrontierResults],
     CI_level: float = DEFAULT_CI_LEVEL,
     show_parameterization_on_hover: bool = True,
+    label_dict: dict[str, str] | None = None,
 ) -> AxPlotConfig:
-    """Plot a pareto frontier from a list of objects"""
+    """Plot a pareto frontier from a list of objects
+
+    Args:
+        frontier_list: List of ParetoFrontierResults objects to be plotted.
+        CI_level: CI level for error bars.
+        show_parameterization_on_hover: Show parameterization on hover.
+        label_dict: Map from metric name to shortened alias to use on plot.
+    """
     if not frontier_list:
         raise ValueError("Must receive a non-empty list of pareto frontiers to plot.")
+    label_dict_use = {k: k for k in frontier_list[0].means}
+    if label_dict is not None:
+        label_dict_use.update(label_dict)
 
     traces = []
     shapes = []
@@ -518,8 +574,8 @@ def interact_pareto_frontier(
             visible[j] = True
         rel_y = frontier.primary_metric not in frontier.absolute_metrics
         rel_x = frontier.secondary_metric not in frontier.absolute_metrics
-        primary_metric = frontier.primary_metric
-        secondary_metric = frontier.secondary_metric
+        primary_metric = label_dict_use[frontier.primary_metric]
+        secondary_metric = label_dict_use[frontier.secondary_metric]
         dropdown.append(
             {
                 "method": "update",
@@ -533,7 +589,7 @@ def interact_pareto_frontier(
                         "shapes": shapes[i],
                     },
                 ],
-                "label": f"{primary_metric} vs {secondary_metric}",
+                "label": f"{primary_metric}<br>vs {secondary_metric}",
             }
         )
 
@@ -541,8 +597,8 @@ def interact_pareto_frontier(
     initial_frontier = frontier_list[0]
     rel_x = initial_frontier.secondary_metric not in initial_frontier.absolute_metrics
     rel_y = initial_frontier.primary_metric not in initial_frontier.absolute_metrics
-    secondary_metric = initial_frontier.secondary_metric
-    primary_metric = initial_frontier.primary_metric
+    secondary_metric = label_dict_use[initial_frontier.secondary_metric]
+    primary_metric = label_dict_use[initial_frontier.primary_metric]
 
     layout = go.Layout(
         title="Pareto Frontier",
@@ -574,16 +630,17 @@ def interact_pareto_frontier(
     )
 
     fig = go.Figure(data=traces, layout=layout)
+    # pyre-fixme[6]: For 1st argument expected `Dict[str, typing.Any]` but got `Figure`.
     return AxPlotConfig(data=fig, plot_type=AxPlotTypes.GENERIC)
 
 
 def interact_multiple_pareto_frontier(
-    frontier_lists: Dict[str, List[ParetoFrontierResults]],
+    frontier_lists: dict[str, list[ParetoFrontierResults]],
     CI_level: float = DEFAULT_CI_LEVEL,
     show_parameterization_on_hover: bool = True,
 ) -> AxPlotConfig:
-    """Plot a Pareto frontiers from a list of lists of NamedParetoFrontierResults objects
-    that we want to compare.
+    """Plot a Pareto frontiers from a list of lists of NamedParetoFrontierResults
+    objects that we want to compare.
 
     Args:
         frontier_lists (Dict[List[ParetoFrontierResults]]): A dictionary of multiple
@@ -716,15 +773,16 @@ def interact_multiple_pareto_frontier(
     )
 
     fig = go.Figure(data=traces, layout=layout)
+    # pyre-fixme[6]: For 1st argument expected `Dict[str, typing.Any]` but got `Figure`.
     return AxPlotConfig(data=fig, plot_type=AxPlotTypes.GENERIC)
 
 
 def _pareto_frontier_plot_input_processing(
     experiment: Experiment,
-    metric_names: Optional[Tuple[str, str]] = None,
-    reference_point: Optional[Tuple[float, float]] = None,
-    minimize: Optional[Union[bool, Tuple[bool, bool]]] = None,
-) -> Tuple[Tuple[str, str], Optional[Tuple[float, float]], Optional[Tuple[bool, bool]]]:
+    metric_names: tuple[str, str] | None = None,
+    reference_point: tuple[float, float] | None = None,
+    minimize: bool | tuple[bool, bool] | None = None,
+) -> tuple[tuple[str, str], tuple[float, float] | None, tuple[bool, bool] | None]:
     """Processes inputs for Pareto frontier + scatterplot.
 
     Args:
@@ -773,10 +831,10 @@ def _pareto_frontier_plot_input_processing(
 
 def _validate_experiment_and_get_optimization_config(
     experiment: Experiment,
-    metric_names: Optional[Tuple[str, str]] = None,
-    reference_point: Optional[Tuple[float, float]] = None,
-    minimize: Optional[Union[bool, Tuple[bool, bool]]] = None,
-) -> Optional[OptimizationConfig]:
+    metric_names: tuple[str, str] | None = None,
+    reference_point: tuple[float, float] | None = None,
+    minimize: bool | tuple[bool, bool] | None = None,
+) -> OptimizationConfig | None:
     # If `optimization_config` is unspecified, check what inputs are missing and
     # error/warn accordingly
     if experiment.optimization_config is None:
@@ -795,24 +853,24 @@ def _validate_experiment_and_get_optimization_config(
                 f"{metric_names}."
             )
         return None
-    return not_none(experiment.optimization_config)
+    return none_throws(experiment.optimization_config)
 
 
 def _validate_and_maybe_get_default_metric_names(
-    metric_names: Optional[Tuple[str, str]],
-    optimization_config: Optional[OptimizationConfig],
-) -> Tuple[str, str]:
+    metric_names: tuple[str, str] | None,
+    optimization_config: OptimizationConfig | None,
+) -> tuple[str, str]:
     # Default metric_names is all metrics, producing an error if more than 2
     if metric_names is None:
-        if not_none(optimization_config).is_moo_problem:
+        if none_throws(optimization_config).is_moo_problem:
             multi_objective = checked_cast(
-                MultiObjective, not_none(optimization_config).objective
+                MultiObjective, none_throws(optimization_config).objective
             )
             metric_names = tuple(obj.metric.name for obj in multi_objective.objectives)
         else:
             raise UserInputError(
                 "Inference of `metric_names` failed. Expected `MultiObjective` but "
-                f"got {not_none(optimization_config).objective}. Please specify "
+                f"got {none_throws(optimization_config).objective}. Please specify "
                 "`metric_names` of length 2 or provide an experiment whose "
                 "`optimization_config` has 2 objective metrics."
             )
@@ -826,27 +884,35 @@ def _validate_and_maybe_get_default_metric_names(
 
 
 def _validate_experiment_and_maybe_get_objective_thresholds(
-    optimization_config: Optional[OptimizationConfig],
-    metric_names: Tuple[str, str],
-    reference_point: Optional[Tuple[float, float]],
-) -> List[ObjectiveThreshold]:
+    optimization_config: OptimizationConfig | None,
+    metric_names: tuple[str, str],
+    reference_point: tuple[float, float] | None,
+) -> list[ObjectiveThreshold]:
     objective_thresholds = []
     # Validate `objective_thresholds` if `reference_point` is unspecified.
     if reference_point is None:
         objective_thresholds = checked_cast(
             MultiObjectiveOptimizationConfig, optimization_config
         ).objective_thresholds
+        if any(
+            ot.relative for ot in objective_thresholds if ot.metric.name in metric_names
+        ):
+            raise NotImplementedError(
+                "Pareto plotting not supported for experiments with relative objective "
+                "thresholds."
+            )
         constraint_metric_names = {
             objective_threshold.metric.name
             for objective_threshold in objective_thresholds
         }
         missing_metric_names = set(metric_names) - set(constraint_metric_names)
-        if len(objective_thresholds) != len(metric_names) or missing_metric_names:
+        if missing_metric_names:
             warnings.warn(
                 "For automatic inference of reference point, expected one "
                 "`objective_threshold` for each metric in `metric_names`: "
-                f"{metric_names}. Got {len(objective_thresholds)}: "
-                f"{objective_thresholds}. Please specify `reference_point` or provide "
+                f"{metric_names}. Missing {missing_metric_names}. Got "
+                f"{len(objective_thresholds)}: {objective_thresholds}. "
+                "Please specify `reference_point` or provide "
                 "an experiment whose `optimization_config` contains one "
                 "objective threshold for each metric. Returning an empty list."
             )
@@ -855,10 +921,10 @@ def _validate_experiment_and_maybe_get_objective_thresholds(
 
 
 def _validate_and_maybe_get_default_reference_point(
-    reference_point: Optional[Tuple[float, float]],
-    objective_thresholds: List[ObjectiveThreshold],
-    metric_names: Tuple[str, str],
-) -> Optional[Tuple[float, float]]:
+    reference_point: tuple[float, float] | None,
+    objective_thresholds: list[ObjectiveThreshold],
+    metric_names: tuple[str, str],
+) -> tuple[float, float] | None:
     if reference_point is None:
         reference_point = {
             objective_threshold.metric.name: objective_threshold.bound
@@ -888,11 +954,11 @@ def _validate_and_maybe_get_default_reference_point(
 
 
 def _validate_and_maybe_get_default_minimize(
-    minimize: Optional[Union[bool, Tuple[bool, bool]]],
-    objective_thresholds: List[ObjectiveThreshold],
-    metric_names: Tuple[str, str],
-    optimization_config: Optional[OptimizationConfig] = None,
-) -> Optional[Tuple[bool, bool]]:
+    minimize: bool | tuple[bool, bool] | None,
+    objective_thresholds: list[ObjectiveThreshold],
+    metric_names: tuple[str, str],
+    optimization_config: OptimizationConfig | None = None,
+) -> tuple[bool, bool] | None:
     if minimize is None:
         # Determine `minimize` defaults
         minimize = tuple(
@@ -911,7 +977,7 @@ def _validate_and_maybe_get_default_minimize(
                 "includes 2 objectives. Returning None."
             )
             return None
-        minimize = tuple(not_none(i_min) for i_min in minimize)
+        minimize = tuple(none_throws(i_min) for i_min in minimize)
     # If only one bool provided, use for both dimensions
     elif isinstance(minimize, bool):
         minimize = (minimize, minimize)
@@ -929,9 +995,9 @@ def _validate_and_maybe_get_default_minimize(
 
 def _maybe_get_default_minimize_single_metric(
     metric_name: str,
-    objective_thresholds: List[ObjectiveThreshold],
-    optimization_config: Optional[OptimizationConfig] = None,
-) -> Optional[bool]:
+    objective_thresholds: list[ObjectiveThreshold],
+    optimization_config: OptimizationConfig | None = None,
+) -> bool | None:
     minimize = None
     # First try to get metric_name from optimization_config
     if (

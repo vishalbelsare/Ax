@@ -4,9 +4,11 @@
 # This source code is licensed under the MIT license found in the
 # LICENSE file in the root directory of this source tree.
 
-from typing import List, Optional, Set, TYPE_CHECKING
+# pyre-strict
 
-from ax.core.observation import ObservationData, ObservationFeatures
+from typing import Optional, TYPE_CHECKING
+
+from ax.core.observation import Observation, ObservationFeatures
 from ax.core.parameter import ParameterType, RangeParameter
 from ax.core.search_space import SearchSpace
 from ax.modelbridge.transforms.base import Transform
@@ -15,25 +17,25 @@ from scipy.special import expit, logit
 
 if TYPE_CHECKING:
     # import as module to make sphinx-autodoc-typehints happy
-    from ax import modelbridge as modelbridge_module  # noqa F401  # pragma: no cover
+    from ax import modelbridge as modelbridge_module  # noqa F401
 
 
 class Logit(Transform):
-    """Apply logit transfor to a float RangeParameter domain.
+    """Apply logit transform to a float RangeParameter domain.
 
     Transform is done in-place.
     """
 
     def __init__(
         self,
-        search_space: SearchSpace,
-        observation_features: List[ObservationFeatures],
-        observation_data: List[ObservationData],
+        search_space: SearchSpace | None = None,
+        observations: list[Observation] | None = None,
         modelbridge: Optional["modelbridge_module.base.ModelBridge"] = None,
-        config: Optional[TConfig] = None,
+        config: TConfig | None = None,
     ) -> None:
+        assert search_space is not None, "Logit requires search space"
         # Identify parameters that should be transformed
-        self.transform_parameters: Set[str] = {
+        self.transform_parameters: set[str] = {
             p_name
             for p_name, p in search_space.parameters.items()
             if isinstance(p, RangeParameter)
@@ -42,8 +44,8 @@ class Logit(Transform):
         }
 
     def transform_observation_features(
-        self, observation_features: List[ObservationFeatures]
-    ) -> List[ObservationFeatures]:
+        self, observation_features: list[ObservationFeatures]
+    ) -> list[ObservationFeatures]:
         for obsf in observation_features:
             for p_name in self.transform_parameters:
                 if p_name in obsf.parameters:
@@ -62,8 +64,8 @@ class Logit(Transform):
         return search_space
 
     def untransform_observation_features(
-        self, observation_features: List[ObservationFeatures]
-    ) -> List[ObservationFeatures]:
+        self, observation_features: list[ObservationFeatures]
+    ) -> list[ObservationFeatures]:
         for obsf in observation_features:
             for p_name in self.transform_parameters:
                 if p_name in obsf.parameters:

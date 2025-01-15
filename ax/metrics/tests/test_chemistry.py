@@ -4,6 +4,8 @@
 # This source code is licensed under the MIT license found in the
 # LICENSE file in the root directory of this source tree.
 
+# pyre-strict
+
 from enum import Enum
 from unittest import mock
 
@@ -17,11 +19,12 @@ from ax.utils.testing.core_stubs import get_trial
 
 
 class DummyEnum(Enum):
+    # pyre-fixme[35]: Target cannot be annotated.
     DUMMY: str = "dummy"
 
 
 class ChemistryMetricTest(TestCase):
-    def testChemistryMetric(self):
+    def test_ChemistryMetric(self) -> None:
         # basic test
         read_csv = pd.read_csv
         for problem_type in (
@@ -79,7 +82,7 @@ class ChemistryMetricTest(TestCase):
                 trial._generator_run = GeneratorRun(
                     arms=[Arm(name="0_0", parameters=params)]
                 )
-                df = metric.fetch_trial_data(trial).df
+                df = metric.fetch_trial_data(trial).unwrap().df
                 self.assertEqual(mock_read_csv.call_count, 1)
                 self.assertEqual(df["mean"].values[0], obj)
                 self.assertTrue(np.isnan(df["sem"].values[0]))
@@ -91,5 +94,5 @@ class ChemistryMetricTest(TestCase):
                 metric = ChemistryMetric(
                     name="test_metric", problem_type=problem_type, noiseless=True
                 )
-                df = metric.fetch_trial_data(trial).df
+                df = metric.fetch_trial_data(trial).unwrap().df
                 self.assertEqual(df["sem"].values[0], 0.0)

@@ -4,8 +4,10 @@
 # This source code is licensed under the MIT license found in the
 # LICENSE file in the root directory of this source tree.
 
+# pyre-strict
+
 import logging
-from typing import List, Tuple
+from collections.abc import Sequence
 
 import numpy as np
 from ax.models.discrete.thompson import ThompsonSampler
@@ -24,19 +26,22 @@ class EmpiricalBayesThompsonSampler(ThompsonSampler):
     """
 
     def _fit_Ys_and_Yvars(
-        self, Ys: List[List[float]], Yvars: List[List[float]], outcome_names: List[str]
-    ) -> Tuple[List[List[float]], List[List[float]]]:
+        self,
+        Ys: Sequence[Sequence[float]],
+        Yvars: Sequence[Sequence[float]],
+        outcome_names: Sequence[str],
+    ) -> tuple[list[list[float]], list[list[float]]]:
         newYs = []
         newYvars = []
         for i, (Y, Yvar) in enumerate(zip(Ys, Yvars)):
-            newY, newYvar = self._apply_shrinkage(Y, Yvar, i)
+            newY, newYvar = self._apply_shrinkage(Y=Y, Yvar=Yvar, outcome=i)
             newYs.append(newY)
             newYvars.append(newYvar)
         return newYs, newYvars
 
     def _apply_shrinkage(
-        self, Y: List[float], Yvar: List[float], outcome: int
-    ) -> Tuple[List[float], List[float]]:
+        self, Y: Sequence[float], Yvar: Sequence[float], outcome: int
+    ) -> tuple[list[float], list[float]]:
         npY = np.array(Y)
         npYvar = np.array(Yvar)
         npYsem = np.sqrt(Yvar)
@@ -47,6 +52,6 @@ class EmpiricalBayesThompsonSampler(ThompsonSampler):
                 str(e) + f" Raw (unshrunk) estimates used for outcome: {outcome}"
             )
         Y = npY.tolist()
-        npYvar = npYsem ** 2
+        npYvar = npYsem**2
         Yvar = npYvar.tolist()
         return Y, Yvar

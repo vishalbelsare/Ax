@@ -4,8 +4,10 @@
 # This source code is licensed under the MIT license found in the
 # LICENSE file in the root directory of this source tree.
 
+# pyre-strict
+
 import warnings
-from typing import Any, List, Optional
+from typing import Any
 
 from ax.core.experiment import Experiment
 from ax.core.search_space import SearchSpace
@@ -14,6 +16,33 @@ from ax.utils.common.base import Base, SortableBase
 
 
 JSON_ATTRS = ["baseline_workflow_inputs"]
+# Skip over the following attrs in `copy_db_ids`:
+# * _experiment (to prevent infinite loops)
+# * most generator run and generation strategy metadata
+#   (since no Base objects are nested in there,
+#   and we don't have guarantees about the structure of some
+#   of that data, so the recursion could fail somewhere)
+COPY_DB_IDS_ATTRS_TO_SKIP = {
+    "_best_arm_predictions",
+    "_bridge_kwargs",
+    "_candidate_metadata_by_arm_signature",
+    "_curr",
+    "_experiment",
+    "_gen_metadata",
+    "_memo_df",
+    "_model_kwargs",
+    "_model_predictions",
+    "_model_state_after_gen",
+    "_model",
+    "_seen_trial_indices_by_status",
+    "_steps",
+    "analysis_scheduler",
+    "_nodes",
+    # For auxiliary experiments, we don't expect any updates, so we
+    # don't need to recur into them during `copy_db_ids`.
+    "auxiliary_experiments_by_purpose",
+}
+SKIP_ATTRS_ERROR_SUFFIX = "Consider adding to COPY_DB_IDS_ATTRS_TO_SKIP if appropriate."
 
 
 def is_foreign_key_field(field: str) -> bool:
@@ -21,7 +50,8 @@ def is_foreign_key_field(field: str) -> bool:
     return len(field) > 3 and field[-3:] == "_id"
 
 
-def copy_db_ids(source: Any, target: Any, path: Optional[List[str]] = None) -> None:
+# pyre-fixme[2]: Parameter annotation cannot be `Any`.
+def copy_db_ids(source: Any, target: Any, path: list[str] | None = None) -> None:
     """Takes as input two objects, `source` and `target`, that should be identical,
     except that `source` has _db_ids set and `target` doesn't. Recursively copies the
     _db_ids from `source` to `target`.
@@ -43,7 +73,7 @@ def copy_db_ids(source: Any, target: Any, path: Optional[List[str]] = None) -> N
         # introducing infinite loops
         raise SQADecodeError(error_message_prefix + "Encountered path of length > 10.")
 
-    if type(source) != type(target):
+    if type(source) is not type(target):
         if not issubclass(type(target), type(source)):
             if source is None and isinstance(target, SearchSpace):
                 warnings.warn(
@@ -56,6 +86,7 @@ def copy_db_ids(source: Any, target: Any, path: Optional[List[str]] = None) -> N
                 raise SQADecodeError(
                     error_message_prefix + "Encountered two objects of different "
                     f"types: {type(source)} and {type(target)}."
+                    + SKIP_ATTRS_ERROR_SUFFIX
                 )
 
     if isinstance(source, Base):
@@ -65,28 +96,8 @@ def copy_db_ids(source: Any, target: Any, path: Optional[List[str]] = None) -> N
                 setattr(target, attr, val)
                 continue
 
-            # Skip over:
-            # * doubly private attributes
-            # * _experiment (to prevent infinite loops)
-            # * most generator run and generation strategy metadata
-            #   (since no Base objects are nested in there,
-            #   and we don't have guarantees about the structure of some
-            #   of that data, so the recursion could fail somewhere)
-            if attr.startswith("__") or attr in {
-                "_best_arm_predictions",
-                "_bridge_kwargs",
-                "_candidate_metadata_by_arm_signature",
-                "_curr",
-                "_experiment",
-                "_gen_metadata",
-                "_model_kwargs",
-                "_model_predictions",
-                "_model_state_after_gen",
-                "_model",
-                "_seen_trial_indices_by_status",
-                "_steps",
-                "analysis_scheduler",
-            }:
+            # Skip attrs that are doubly private or in COPY_DB_IDS_TO_SKIP.
+            if attr.startswith("__") or attr in COPY_DB_IDS_ATTRS_TO_SKIP:
                 continue
 
             # For Json attributes we would like to simply test for equality and not
@@ -137,9 +148,13 @@ def copy_db_ids(source: Any, target: Any, path: Optional[List[str]] = None) -> N
             source = sorted(source)
             target = sorted(target)
         except TypeError as e:
-            raise SQADecodeError(
-                error_message_prefix + f"TypeError encountered during sorting: {e}"
-            )
+            if any(isinstance(o, Base) for o in source + target):
+                raise SQADecodeError(
+                    error_message_prefix + f"TypeError encountered during sorting: {e}"
+                )
+            else:
+                # source and target are not lists of things that need to be saved
+                return
 
         for index, x in enumerate(source):
             copy_db_ids(x, target[index], path + [str(index)])

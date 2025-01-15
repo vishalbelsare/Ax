@@ -4,13 +4,18 @@
 # This source code is licensed under the MIT license found in the
 # LICENSE file in the root directory of this source tree.
 
+# pyre-strict
+
 from __future__ import annotations
 
-from typing import Callable, List, Optional, Tuple, TYPE_CHECKING
+from logging import Logger
+from typing import Callable, TYPE_CHECKING
 
 import numpy as np
-from ax.core.observation import ObservationData, ObservationFeatures
+import numpy.typing as npt
+from ax.core.observation import Observation, ObservationData, ObservationFeatures
 from ax.core.optimization_config import OptimizationConfig
+from ax.core.outcome_constraint import OutcomeConstraint
 from ax.core.search_space import SearchSpace
 from ax.modelbridge.transforms.base import Transform
 from ax.models.types import TConfig
@@ -20,10 +25,10 @@ from scipy.stats import norm
 
 if TYPE_CHECKING:
     # import as module to make sphinx-autodoc-typehints happy
-    from ax.modelbridge import base as base_modelbridge  # noqa F401  # pragma: no cover
+    from ax.modelbridge import base as base_modelbridge  # noqa F401
 
 
-logger = get_logger(__name__)
+logger: Logger = get_logger(__name__)
 
 
 class LogY(Transform):
@@ -36,15 +41,18 @@ class LogY(Transform):
 
     Transform is applied only for the metrics specified in the transform config.
     Transform is done in-place.
+
+    NOTE: If the observation noise is not provided, we simply log-transform the
+    mean as if the observation noise was zero. This can be inaccurate when the
+    unknown observation noise is large.
     """
 
     def __init__(
         self,
-        search_space: SearchSpace,
-        observation_features: List[ObservationFeatures],
-        observation_data: List[ObservationData],
-        modelbridge: Optional["base_modelbridge.ModelBridge"] = None,
-        config: Optional[TConfig] = None,
+        search_space: SearchSpace | None = None,
+        observations: list[Observation] | None = None,
+        modelbridge: base_modelbridge.ModelBridge | None = None,
+        config: TConfig | None = None,
     ) -> None:
         if config is None:
             raise ValueError("LogY requires a config.")
@@ -56,15 +64,17 @@ class LogY(Transform):
             raise ValueError("Must specify at least one metric in the config.")
         super().__init__(
             search_space=search_space,
-            observation_features=observation_features,
-            observation_data=observation_data,
+            observations=observations,
             config=config,
         )
+        # pyre-fixme[4]: Attribute must be annotated.
         self.metric_names = metric_names
         if config.get("match_ci_width", False):
             # perform moment-matching to compute variance that results in a CI
             # of same width as the when transforming the moments
+            # pyre-fixme[4]: Attribute must be annotated.
             self._transform = lambda m, v: match_ci_width(m, v, np.log)
+            # pyre-fixme[4]: Attribute must be annotated.
             self._untransform = lambda m, v: match_ci_width(m, v, np.exp)
         else:
             self._transform = lognorm_to_norm
@@ -73,8 +83,8 @@ class LogY(Transform):
     def transform_optimization_config(
         self,
         optimization_config: OptimizationConfig,
-        modelbridge: Optional[base_modelbridge.ModelBridge],
-        fixed_features: ObservationFeatures,
+        modelbridge: base_modelbridge.ModelBridge | None = None,
+        fixed_features: ObservationFeatures | None = None,
     ) -> OptimizationConfig:
         for c in optimization_config.all_constraints:
             if c.metric.name in self.metric_names:
@@ -93,10 +103,11 @@ class LogY(Transform):
 
     def _tf_obs_data(
         self,
-        observation_data: List[ObservationData],
-        observation_features: List[ObservationFeatures],
-        transform: Callable[[np.ndarray, np.ndarray], Tuple[np.ndarray, np.ndarray]],
-    ) -> List[ObservationData]:
+        observation_data: list[ObservationData],
+        transform: Callable[
+            [npt.NDArray, npt.NDArray], tuple[npt.NDArray, npt.NDArray]
+        ],
+    ) -> list[ObservationData]:
         for obsd in observation_data:
             cov = obsd.covariance
             idcs = [
@@ -124,31 +135,37 @@ class LogY(Transform):
                 obsd.covariance = cov
         return observation_data
 
-    def transform_observation_data(
+    def _transform_observation_data(
         self,
-        observation_data: List[ObservationData],
-        observation_features: List[ObservationFeatures],
-    ) -> List[ObservationData]:
-        return self._tf_obs_data(
-            observation_data, observation_features, self._transform
-        )
+        observation_data: list[ObservationData],
+    ) -> list[ObservationData]:
+        return self._tf_obs_data(observation_data, self._transform)
 
-    def untransform_observation_data(
+    def _untransform_observation_data(
         self,
-        observation_data: List[ObservationData],
-        observation_features: List[ObservationFeatures],
-    ) -> List[ObservationData]:
-        return self._tf_obs_data(
-            observation_data, observation_features, self._untransform
-        )
+        observation_data: list[ObservationData],
+    ) -> list[ObservationData]:
+        return self._tf_obs_data(observation_data, self._untransform)
+
+    def untransform_outcome_constraints(
+        self,
+        outcome_constraints: list[OutcomeConstraint],
+        fixed_features: ObservationFeatures | None = None,
+    ) -> list[OutcomeConstraint]:
+        for c in outcome_constraints:
+            if c.metric.name in self.metric_names:
+                if c.relative:
+                    raise ValueError("Unexpected relative transform.")
+                c.bound = np.exp(c.bound)
+        return outcome_constraints
 
 
 def match_ci_width(
-    mean: np.ndarray,
-    variance: np.ndarray,
-    transform: Callable[[np.ndarray], np.ndarray],
+    mean: npt.NDArray,
+    variance: npt.NDArray,
+    transform: Callable[[npt.NDArray], npt.NDArray],
     level: float = 0.95,
-) -> np.ndarray:
+) -> npt.NDArray:
     fac = norm.ppf(1 - (1 - level) / 2)
     d = fac * np.sqrt(variance)
     width_asym = transform(mean + d) - transform(mean - d)
@@ -159,34 +176,45 @@ def match_ci_width(
 
 
 def lognorm_to_norm(
-    mu_ln: np.ndarray, Cov_ln: np.ndarray
-) -> Tuple[np.ndarray, np.ndarray]:
-    """Compute mean and covariance of a MVN from those of the associated log-MVN
+    mu_ln: npt.NDArray,
+    Cov_ln: npt.NDArray,
+) -> tuple[npt.NDArray, npt.NDArray]:
+    """Compute mean and covariance of a MVN from those of the associated log-MVN.
 
     If `Y` is log-normal with mean mu_ln and covariance Cov_ln, then
     `X ~ N(mu_n, Cov_n)` with
 
         Cov_n_{ij} = log(1 + Cov_ln_{ij} / (mu_ln_{i} * mu_n_{j}))
         mu_n_{i} = log(mu_ln_{i}) - 0.5 * log(1 + Cov_ln_{ii} / mu_ln_{i}**2)
+
+    NOTE: If the observation noise is not provided, we simply log-transform the
+    mean as if the observation noise was zero. This can be inaccurate when the
+    unknown observation noise is large.
     """
     Cov_n = np.log(1 + Cov_ln / np.outer(mu_ln, mu_ln))
-    mu_n = np.log(mu_ln) - 0.5 * np.diag(Cov_n)
+    mu_n = np.log(mu_ln) - 0.5 * np.nan_to_num(np.diag(Cov_n), nan=0.0)
     return mu_n, Cov_n
 
 
 def norm_to_lognorm(
-    mu_n: np.ndarray, Cov_n: np.ndarray
-) -> Tuple[np.ndarray, np.ndarray]:
-    """Compute mean and covariance of a log-MVN from its MVN sufficient statistics
+    mu_n: npt.NDArray,
+    Cov_n: npt.NDArray,
+) -> tuple[npt.NDArray, npt.NDArray]:
+    """Compute mean and covariance of a log-MVN from its MVN sufficient statistics.
 
     If `X ~ N(mu_n, Cov_n)` and `Y = exp(X)`, then `Y` is log-normal with
 
         mu_ln_{i} = exp(mu_n_{i}) + 0.5 * Cov_n_{ii}
         Cov_ln_{ij} = exp(mu_n_{i} + mu_n_{j} + 0.5 * (Cov_n_{ii} + Cov_n_{jj})) *
         (exp(Cov_n_{ij}) - 1)
+
+
+    NOTE: If the observation noise is not provided, we simply take the exponent of the
+    mean as if the observation noise was zero. This can be inaccurate when the
+    unknown observation noise is large.
     """
     diag_n = np.diag(Cov_n)
-    b = mu_n + 0.5 * diag_n
+    b = mu_n + 0.5 * np.nan_to_num(diag_n, nan=0.0)
     mu_ln = np.exp(b)
     Cov_ln = (np.exp(Cov_n) - 1) * np.exp(b.reshape(-1, 1) + b.reshape(1, -1))
     return mu_ln, Cov_ln

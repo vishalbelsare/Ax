@@ -4,6 +4,10 @@
 # This source code is licensed under the MIT license found in the
 # LICENSE file in the root directory of this source tree.
 
+# pyre-strict
+
+from itertools import product
+
 import numpy as np
 import pandas as pd
 from ax.core.data import Data
@@ -11,12 +15,14 @@ from ax.utils.common.testutils import TestCase
 from ax.utils.stats.statstools import (
     inverse_variance_weight,
     marginal_effects,
+    relativize,
     relativize_data,
+    unrelativize,
 )
 
 
 class InverseVarianceWeightingTest(TestCase):
-    def test_bad_arg_ivw(self):
+    def test_bad_arg_ivw(self) -> None:
         with self.assertRaises(ValueError):
             inverse_variance_weight(
                 np.array([0]), np.array([1]), conflicting_noiseless="foo"
@@ -24,28 +30,28 @@ class InverseVarianceWeightingTest(TestCase):
         with self.assertRaises(ValueError):
             inverse_variance_weight(np.array([1, 2]), np.array([1]))
 
-    def test_very_simple_ivw(self):
+    def test_very_simple_ivw(self) -> None:
         means = np.array([1, 1, 1])
         variances = np.array([1, 1, 1])
         new_mean, new_var = inverse_variance_weight(means, variances)
         self.assertEqual(new_mean, 1.0)
         self.assertEqual(new_var, 1 / 3)
 
-    def test_simple_ivw(self):
+    def test_simple_ivw(self) -> None:
         means = np.array([1, 2, 3])
         variances = np.array([1, 1, 1])
         new_mean, new_var = inverse_variance_weight(means, variances)
         self.assertEqual(new_mean, 2.0)
         self.assertEqual(new_var, 1 / 3)
 
-    def test_another_simple_ivw(self):
+    def test_another_simple_ivw(self) -> None:
         means = np.array([1, 3])
         variances = np.array([1, 3])
         new_mean, new_var = inverse_variance_weight(means, variances)
         self.assertEqual(new_mean, 1.5)
         self.assertEqual(new_var, 0.75)
 
-    def test_conflicting_noiseless_ivw(self):
+    def test_conflicting_noiseless_ivw(self) -> None:
         means = np.array([1, 2, 1])
         variances = np.array([0, 0, 1])
 
@@ -58,7 +64,7 @@ class InverseVarianceWeightingTest(TestCase):
 
 
 class MarginalEffectsTest(TestCase):
-    def test_marginal_effects(self):
+    def test_marginal_effects(self) -> None:
         df = pd.DataFrame(
             {
                 "mean": [1, 2, 3, 4],
@@ -73,7 +79,7 @@ class MarginalEffectsTest(TestCase):
 
 
 class RelativizeDataTest(TestCase):
-    def test_relativize_data(self):
+    def test_relativize_data(self) -> None:
         data = Data(
             df=pd.DataFrame(
                 [
@@ -140,3 +146,52 @@ class RelativizeDataTest(TestCase):
         self.assertEqual(
             expected_relativized_data_with_sq, actual_relativized_data_with_sq
         )
+
+
+class UnrelativizeTest(TestCase):
+    def test_unrelativize(self) -> None:
+        means_t = np.array([-100.0, 101.0, 200.0, 300.0, 400.0])
+        sems_t = np.array([2.0, 3.0, 2.0, 4.0, 0.0])
+        mean_c = 200.0
+        sem_c = 2.0
+
+        for bias_correction, cov_means, as_percent, control_as_constant in product(
+            (True, False, None),
+            (0.5, 0.0),
+            (True, False, None),
+            (True, False, None),
+        ):
+            rel_mean_t, rel_sems_t = relativize(
+                means_t,
+                sems_t,
+                mean_c,
+                sem_c,
+                cov_means=cov_means,
+                # pyre-fixme[6]: For 6th argument expected `bool` but got
+                #  `Optional[bool]`.
+                bias_correction=bias_correction,
+                # pyre-fixme[6]: For 7th argument expected `bool` but got
+                #  `Optional[bool]`.
+                as_percent=as_percent,
+                # pyre-fixme[6]: For 8th argument expected `bool` but got
+                #  `Optional[bool]`.
+                control_as_constant=control_as_constant,
+            )
+            unrel_mean_t, unrel_sems_t = unrelativize(
+                rel_mean_t,
+                rel_sems_t,
+                mean_c,
+                sem_c,
+                cov_means=cov_means,
+                # pyre-fixme[6]: For 6th argument expected `bool` but got
+                #  `Optional[bool]`.
+                bias_correction=bias_correction,
+                # pyre-fixme[6]: For 7th argument expected `bool` but got
+                #  `Optional[bool]`.
+                as_percent=as_percent,
+                # pyre-fixme[6]: For 8th argument expected `bool` but got
+                #  `Optional[bool]`.
+                control_as_constant=control_as_constant,
+            )
+            self.assertTrue(np.allclose(means_t, unrel_mean_t))
+            self.assertTrue(np.allclose(sems_t, unrel_sems_t))

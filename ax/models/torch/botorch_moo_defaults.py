@@ -4,6 +4,8 @@
 # This source code is licensed under the MIT license found in the
 # LICENSE file in the root directory of this source tree.
 
+# pyre-strict
+
 """
 References
 
@@ -17,30 +19,48 @@ References
     Multiple Noisy Objectives with Expected Hypervolume Improvement. Advances
     in Neural Information Processing Systems 34, 2021.
 
+.. [Ament2023logei]
+    S. Ament, S. Daulton, D. Eriksson, M. Balandat, and E. Bakshy.
+    Unexpected Improvements to Expected Improvement for Bayesian Optimization. Advances
+    in Neural Information Processing Systems 36, 2023.
 """
 
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from __future__ import annotations
+
+from collections.abc import Callable
+
+from typing import cast, Optional, Union
 
 import torch
 from ax.exceptions.core import AxError
-from ax.models.torch.utils import (  # noqa F40
+from ax.models.torch.botorch_defaults import NO_OBSERVED_POINTS_MESSAGE
+from ax.models.torch.utils import (
     _get_X_pending_and_observed,
-    _to_inequality_constraints,
     get_outcome_constraint_transforms,
-    predict_from_model,
     subset_model,
 )
 from ax.models.torch_base import TorchModel
-from ax.utils.common.constants import Keys
-from ax.utils.common.typeutils import not_none
+from ax.utils.common.typeutils import checked_cast
+from botorch.acquisition import get_acquisition_function
 from botorch.acquisition.acquisition import AcquisitionFunction
+from botorch.acquisition.multi_objective.logei import (
+    qLogExpectedHypervolumeImprovement,
+    qLogNoisyExpectedHypervolumeImprovement,
+)
+from botorch.acquisition.multi_objective.monte_carlo import (
+    qExpectedHypervolumeImprovement,
+    qNoisyExpectedHypervolumeImprovement,
+)
 from botorch.acquisition.multi_objective.objective import WeightedMCMultiOutputObjective
 from botorch.acquisition.multi_objective.utils import get_default_partitioning_alpha
-from botorch.acquisition.utils import get_acquisition_function
 from botorch.models.model import Model
 from botorch.optim.optimize import optimize_acqf_list
+from botorch.posteriors.gpytorch import GPyTorchPosterior
+from botorch.posteriors.posterior import Posterior
+from botorch.posteriors.posterior_list import PosteriorList
 from botorch.utils.multi_objective.hypervolume import infer_reference_point
 from botorch.utils.multi_objective.pareto import is_non_dominated
+from pyre_extensions import none_throws
 from torch import Tensor
 
 DEFAULT_EHVI_MC_SAMPLES = 128
@@ -57,19 +77,21 @@ TFrontierEvaluator = Callable[
         Optional[Tensor],
         Optional[Tensor],
         Optional[Tensor],
-        Optional[Tuple[Tensor, Tensor]],
+        Optional[tuple[Tensor, Tensor]],
     ],
-    Tuple[Tensor, Tensor, Tensor],
+    tuple[Tensor, Tensor, Tensor],
 ]
 
-
-def get_default_frontier_evaluator() -> TFrontierEvaluator:
-    return pareto_frontier_evaluator
+NO_FEASIBLE_POINTS_MESSAGE = (
+    " Cannot infer objective thresholds due to no observed feasible points. "
+    " This likely means that one or more outcome constraints is set too strictly.  "
+    " Consider adding thresholds to your objectives to bypass this error."
+)
 
 
 def get_weighted_mc_objective_and_objective_thresholds(
     objective_weights: Tensor, objective_thresholds: Tensor
-) -> Tuple[WeightedMCMultiOutputObjective, Tensor]:
+) -> tuple[WeightedMCMultiOutputObjective, Tensor]:
     r"""Construct weighted objective and apply the weights to objective thresholds.
 
     Args:
@@ -100,11 +122,17 @@ def get_NEHVI(
     model: Model,
     objective_weights: Tensor,
     objective_thresholds: Tensor,
-    outcome_constraints: Optional[Tuple[Tensor, Tensor]] = None,
-    X_observed: Optional[Tensor] = None,
-    X_pending: Optional[Tensor] = None,
-    **kwargs: Any,
-) -> AcquisitionFunction:
+    outcome_constraints: tuple[Tensor, Tensor] | None = None,
+    X_observed: Tensor | None = None,
+    X_pending: Tensor | None = None,
+    *,
+    prune_baseline: bool = True,
+    mc_samples: int = DEFAULT_EHVI_MC_SAMPLES,
+    alpha: float | None = None,
+    marginalize_dim: int | None = None,
+    cache_root: bool = True,
+    seed: int | None = None,
+) -> qNoisyExpectedHypervolumeImprovement:
     r"""Instantiates a qNoisyExpectedHyperVolumeImprovement acquisition function.
 
     Args:
@@ -122,16 +150,126 @@ def get_NEHVI(
             that have been submitted for evaluation) present for all objective
             outcomes and outcomes that appear in the outcome constraints (if
             there are any).
-        mc_samples: The number of MC samples to use (default: 512).
-        qmc: If True, use qMC instead of MC (default: True).
         prune_baseline: If True, prune the baseline points for NEI (default: True).
-        chebyshev_scalarization: Use augmented Chebyshev scalarization.
+        mc_samples: The number of MC samples to use (default: 512).
+        alpha: The hyperparameter controlling the approximate non-dominated
+            partitioning. The default value of 0.0 means an exact partitioning
+            is used. As the number of objectives `m` increases, consider increasing
+            this parameter in order to limit computational complexity (default: None).
+        marginalize_dim: The dimension along which to marginalize over, used for fully
+            Bayesian models (default: None).
+        cache_root: If True, cache the root of the covariance matrix (default: True).
+        seed: The random seed for generating random starting points for optimization (
+            default: None).
 
     Returns:
         qNoisyExpectedHyperVolumeImprovement: The instantiated acquisition function.
     """
+    return checked_cast(
+        qNoisyExpectedHypervolumeImprovement,
+        _get_NEHVI(
+            acqf_name="qNEHVI",
+            model=model,
+            objective_weights=objective_weights,
+            objective_thresholds=objective_thresholds,
+            outcome_constraints=outcome_constraints,
+            X_observed=X_observed,
+            X_pending=X_pending,
+            prune_baseline=prune_baseline,
+            mc_samples=mc_samples,
+            alpha=alpha,
+            marginalize_dim=marginalize_dim,
+            cache_root=cache_root,
+            seed=seed,
+        ),
+    )
+
+
+def get_qLogNEHVI(
+    model: Model,
+    objective_weights: Tensor,
+    objective_thresholds: Tensor,
+    outcome_constraints: tuple[Tensor, Tensor] | None = None,
+    X_observed: Tensor | None = None,
+    X_pending: Tensor | None = None,
+    *,
+    prune_baseline: bool = True,
+    mc_samples: int = DEFAULT_EHVI_MC_SAMPLES,
+    alpha: float | None = None,
+    marginalize_dim: int | None = None,
+    cache_root: bool = True,
+    seed: int | None = None,
+) -> qLogNoisyExpectedHypervolumeImprovement:
+    r"""Instantiates a qLogNoisyExpectedHyperVolumeImprovement acquisition function.
+
+    Args:
+        model: The underlying model which the acqusition function uses
+            to estimate acquisition values of candidates.
+        objective_weights: The objective is to maximize a weighted sum of
+            the columns of f(x). These are the weights.
+        outcome_constraints: A tuple of (A, b). For k outcome constraints
+            and m outputs at f(x), A is (k x m) and b is (k x 1) such that
+            A f(x) <= b. (Not used by single task models)
+        X_observed: A tensor containing points observed for all objective
+            outcomes and outcomes that appear in the outcome constraints (if
+            there are any).
+        X_pending: A tensor containing points whose evaluation is pending (i.e.
+            that have been submitted for evaluation) present for all objective
+            outcomes and outcomes that appear in the outcome constraints (if
+            there are any).
+        prune_baseline: If True, prune the baseline points for NEI (default: True).
+        mc_samples: The number of MC samples to use (default: 512).
+        alpha: The hyperparameter controlling the approximate non-dominated
+            partitioning. The default value of 0.0 means an exact partitioning
+            is used. As the number of objectives `m` increases, consider increasing
+            this parameter in order to limit computational complexity (default: None).
+        marginalize_dim: The dimension along which to marginalize over, used for fully
+            Bayesian models (default: None).
+        cache_root: If True, cache the root of the covariance matrix (default: True).
+        seed: The random seed for generating random starting points for optimization (
+            default: None).
+
+    Returns:
+        qLogNoisyExpectedHyperVolumeImprovement: The instantiated acquisition function.
+    """
+    return checked_cast(
+        qLogNoisyExpectedHypervolumeImprovement,
+        _get_NEHVI(
+            acqf_name="qLogNEHVI",
+            model=model,
+            objective_weights=objective_weights,
+            objective_thresholds=objective_thresholds,
+            outcome_constraints=outcome_constraints,
+            X_observed=X_observed,
+            X_pending=X_pending,
+            prune_baseline=prune_baseline,
+            mc_samples=mc_samples,
+            alpha=alpha,
+            marginalize_dim=marginalize_dim,
+            cache_root=cache_root,
+            seed=seed,
+        ),
+    )
+
+
+def _get_NEHVI(
+    acqf_name: str,
+    model: Model,
+    objective_weights: Tensor,
+    objective_thresholds: Tensor,
+    outcome_constraints: tuple[Tensor, Tensor] | None = None,
+    X_observed: Tensor | None = None,
+    X_pending: Tensor | None = None,
+    *,
+    prune_baseline: bool = True,
+    mc_samples: int = DEFAULT_EHVI_MC_SAMPLES,
+    alpha: float | None = None,
+    marginalize_dim: int | None = None,
+    cache_root: bool = True,
+    seed: int | None = None,
+) -> qNoisyExpectedHypervolumeImprovement | qLogNoisyExpectedHypervolumeImprovement:
     if X_observed is None:
-        raise ValueError("There are no feasible observed points.")
+        raise ValueError(NO_OBSERVED_POINTS_MESSAGE)
     # construct Objective module
     (
         objective,
@@ -145,26 +283,34 @@ def get_NEHVI(
     else:
         cons_tfs = get_outcome_constraint_transforms(outcome_constraints)
     num_objectives = objective_thresholds.shape[0]
-    return get_acquisition_function(
-        acquisition_function_name="qNEHVI",
-        model=model,
-        objective=objective,
-        X_observed=X_observed,
-        X_pending=X_pending,
-        constraints=cons_tfs,
-        prune_baseline=kwargs.get("prune_baseline", True),
-        mc_samples=kwargs.get("mc_samples", DEFAULT_EHVI_MC_SAMPLES),
-        alpha=kwargs.get(
-            "alpha", get_default_partitioning_alpha(num_objectives=num_objectives)
+    if alpha is None:
+        alpha = get_default_partitioning_alpha(num_objectives=num_objectives)
+    # NOTE: Not using checked_cast here because for Python 3.9, isinstance fails with
+    # `TypeError: Subscripted generics cannot be used with class and instance checks`.
+    return cast(
+        Union[
+            qNoisyExpectedHypervolumeImprovement,
+            qLogNoisyExpectedHypervolumeImprovement,
+        ],
+        get_acquisition_function(
+            acquisition_function_name=acqf_name,
+            model=model,
+            objective=objective,
+            X_observed=X_observed,
+            X_pending=X_pending,
+            constraints=cons_tfs,
+            prune_baseline=prune_baseline,
+            mc_samples=mc_samples,
+            alpha=alpha,
+            seed=(
+                seed
+                if seed is not None
+                else cast(int, torch.randint(1, 10000, (1,)).item())
+            ),
+            ref_point=objective_thresholds.tolist(),
+            marginalize_dim=marginalize_dim,
+            cache_root=cache_root,
         ),
-        qmc=kwargs.get("qmc", True),
-        # pyre-fixme[6]: Expected `Optional[int]` for 11th param but got
-        #  `Union[float, int]`.
-        seed=torch.randint(1, 10000, (1,)).item(),
-        ref_point=objective_thresholds.tolist(),
-        marginalize_dim=kwargs.get("marginalize_dim"),
-        match_right_most_batch_dim=kwargs.get("match_right_most_batch_dim", False),
-        cache_root=kwargs.get("cache_root", True),
     )
 
 
@@ -172,11 +318,14 @@ def get_EHVI(
     model: Model,
     objective_weights: Tensor,
     objective_thresholds: Tensor,
-    outcome_constraints: Optional[Tuple[Tensor, Tensor]] = None,
-    X_observed: Optional[Tensor] = None,
-    X_pending: Optional[Tensor] = None,
-    **kwargs: Any,
-) -> AcquisitionFunction:
+    outcome_constraints: tuple[Tensor, Tensor] | None = None,
+    X_observed: Tensor | None = None,
+    X_pending: Tensor | None = None,
+    *,
+    mc_samples: int = DEFAULT_EHVI_MC_SAMPLES,
+    alpha: float | None = None,
+    seed: int | None = None,
+) -> qExpectedHypervolumeImprovement:
     r"""Instantiates a qExpectedHyperVolumeImprovement acquisition function.
 
     Args:
@@ -198,13 +347,106 @@ def get_EHVI(
             outcomes and outcomes that appear in the outcome constraints (if
             there are any).
         mc_samples: The number of MC samples to use (default: 512).
-        qmc: If True, use qMC instead of MC (default: True).
+        alpha: The hyperparameter controlling the approximate non-dominated
+            partitioning. The default value of 0.0 means an exact partitioning
+            is used. As the number of objectives `m` increases, consider increasing
+            this parameter in order to limit computational complexity.
+        seed: The random seed for generating random starting points for optimization.
 
     Returns:
         qExpectedHypervolumeImprovement: The instantiated acquisition function.
     """
+    return checked_cast(
+        qExpectedHypervolumeImprovement,
+        _get_EHVI(
+            acqf_name="qEHVI",
+            model=model,
+            objective_weights=objective_weights,
+            objective_thresholds=objective_thresholds,
+            outcome_constraints=outcome_constraints,
+            X_observed=X_observed,
+            X_pending=X_pending,
+            mc_samples=mc_samples,
+            alpha=alpha,
+            seed=seed,
+        ),
+    )
+
+
+def get_qLogEHVI(
+    model: Model,
+    objective_weights: Tensor,
+    objective_thresholds: Tensor,
+    outcome_constraints: tuple[Tensor, Tensor] | None = None,
+    X_observed: Tensor | None = None,
+    X_pending: Tensor | None = None,
+    *,
+    mc_samples: int = DEFAULT_EHVI_MC_SAMPLES,
+    alpha: float | None = None,
+    seed: int | None = None,
+) -> qLogExpectedHypervolumeImprovement:
+    r"""Instantiates a qLogExpectedHyperVolumeImprovement acquisition function.
+
+    Args:
+        model: The underlying model which the acqusition function uses
+            to estimate acquisition values of candidates.
+        objective_weights: The objective is to maximize a weighted sum of
+            the columns of f(x). These are the weights.
+        objective_thresholds:  A tensor containing thresholds forming a reference point
+            from which to calculate pareto frontier hypervolume. Points that do not
+            dominate the objective_thresholds contribute nothing to hypervolume.
+        outcome_constraints: A tuple of (A, b). For k outcome constraints
+            and m outputs at f(x), A is (k x m) and b is (k x 1) such that
+            A f(x) <= b. (Not used by single task models)
+        X_observed: A tensor containing points observed for all objective
+            outcomes and outcomes that appear in the outcome constraints (if
+            there are any).
+        X_pending: A tensor containing points whose evaluation is pending (i.e.
+            that have been submitted for evaluation) present for all objective
+            outcomes and outcomes that appear in the outcome constraints (if
+            there are any).
+        mc_samples: The number of MC samples to use (default: 512).
+        alpha: The hyperparameter controlling the approximate non-dominated
+            partitioning. The default value of 0.0 means an exact partitioning
+            is used. As the number of objectives `m` increases, consider increasing
+            this parameter in order to limit computational complexity.
+        seed: The random seed for generating random starting points for optimization.
+
+    Returns:
+        qLogExpectedHypervolumeImprovement: The instantiated acquisition function.
+    """
+    return checked_cast(
+        qLogExpectedHypervolumeImprovement,
+        _get_EHVI(
+            acqf_name="qLogEHVI",
+            model=model,
+            objective_weights=objective_weights,
+            objective_thresholds=objective_thresholds,
+            outcome_constraints=outcome_constraints,
+            X_observed=X_observed,
+            X_pending=X_pending,
+            mc_samples=mc_samples,
+            alpha=alpha,
+            seed=seed,
+        ),
+    )
+
+
+def _get_EHVI(
+    acqf_name: str,
+    model: Model,
+    objective_weights: Tensor,
+    objective_thresholds: Tensor,
+    outcome_constraints: tuple[Tensor, Tensor] | None = None,
+    X_observed: Tensor | None = None,
+    X_pending: Tensor | None = None,
+    *,
+    mc_samples: int = DEFAULT_EHVI_MC_SAMPLES,
+    alpha: float | None = None,
+    seed: int | None = None,
+) -> qExpectedHypervolumeImprovement | qLogExpectedHypervolumeImprovement:
     if X_observed is None:
-        raise ValueError("There are no feasible observed points.")
+        raise ValueError(NO_OBSERVED_POINTS_MESSAGE)
     # construct Objective module
     (
         objective,
@@ -213,42 +455,52 @@ def get_EHVI(
         objective_weights=objective_weights, objective_thresholds=objective_thresholds
     )
     with torch.no_grad():
-        Y = model.posterior(X_observed).mean
+        Y = _check_posterior_type(model.posterior(X_observed)).mean
     # For EHVI acquisition functions we pass the constraint transform directly.
     if outcome_constraints is None:
         cons_tfs = None
     else:
         cons_tfs = get_outcome_constraint_transforms(outcome_constraints)
     num_objectives = objective_thresholds.shape[0]
-    return get_acquisition_function(
-        acquisition_function_name="qEHVI",
-        model=model,
-        objective=objective,
-        X_observed=X_observed,
-        X_pending=X_pending,
-        constraints=cons_tfs,
-        mc_samples=kwargs.get("mc_samples", DEFAULT_EHVI_MC_SAMPLES),
-        qmc=kwargs.get("qmc", True),
-        alpha=kwargs.get(
-            "alpha", get_default_partitioning_alpha(num_objectives=num_objectives)
+    # NOTE: Not using checked_cast here because for Python 3.9, isinstance fails with
+    # `TypeError: Subscripted generics cannot be used with class and instance checks`.
+    return cast(
+        Union[qExpectedHypervolumeImprovement, qLogExpectedHypervolumeImprovement],
+        get_acquisition_function(
+            acquisition_function_name=acqf_name,
+            model=model,
+            objective=objective,
+            X_observed=X_observed,
+            X_pending=X_pending,
+            constraints=cons_tfs,
+            mc_samples=mc_samples,
+            alpha=(
+                get_default_partitioning_alpha(num_objectives=num_objectives)
+                if alpha is None
+                else alpha
+            ),
+            seed=(
+                seed
+                if seed is not None
+                else cast(int, torch.randint(1, 10000, (1,)).item())
+            ),
+            ref_point=objective_thresholds.tolist(),
+            Y=Y,
         ),
-        # pyre-fixme[6]: Expected `Optional[int]` for 10th param but got
-        #  `Union[float, int]`.
-        seed=torch.randint(1, 10000, (1,)).item(),
-        ref_point=objective_thresholds.tolist(),
-        Y=Y,
     )
 
 
 # TODO (jej): rewrite optimize_acqf wrappers to avoid duplicate code.
 def scipy_optimizer_list(
-    acq_function_list: List[AcquisitionFunction],
+    acq_function_list: list[AcquisitionFunction],
     bounds: Tensor,
-    inequality_constraints: Optional[List[Tuple[Tensor, Tensor, float]]] = None,
-    fixed_features: Optional[Dict[int, float]] = None,
-    rounding_func: Optional[Callable[[Tensor], Tensor]] = None,
-    **kwargs: Any,
-) -> Tuple[Tensor, Tensor]:
+    inequality_constraints: list[tuple[Tensor, Tensor, float]] | None = None,
+    fixed_features: dict[int, float] | None = None,
+    rounding_func: Callable[[Tensor], Tensor] | None = None,
+    num_restarts: int = 20,
+    raw_samples: int | None = None,
+    options: dict[str, bool | float | int | str] | None = None,
+) -> tuple[Tensor, Tensor]:
     r"""Sequential optimizer using scipy's minimize module on a numpy-adaptor.
 
     The ith acquisition in the sequence uses the ith given acquisition_function.
@@ -275,18 +527,20 @@ def scipy_optimizer_list(
           values, where `i`-th element is the expected acquisition value
           conditional on having observed candidates `0,1,...,i-1`.
     """
-    num_restarts: int = kwargs.pop(Keys.NUM_RESTARTS, 20)
-    raw_samples: int = kwargs.pop(Keys.RAW_SAMPLES, 50 * num_restarts)
-
-    # use SLSQP by default for small problems since it yields faster wall times
-    if "method" not in kwargs:
-        kwargs["method"] = "SLSQP"
+    # Use SLSQP by default for small problems since it yields faster wall times.
+    optimize_options: dict[str, bool | float | int | str] = {
+        "batch_limit": 5,
+        "init_batch_limit": 32,
+        "method": "SLSQP",
+    }
+    if options is not None:
+        optimize_options.update(options)
     X, expected_acquisition_value = optimize_acqf_list(
         acq_function_list=acq_function_list,
         bounds=bounds,
         num_restarts=num_restarts,
-        raw_samples=raw_samples,
-        options=kwargs,
+        raw_samples=50 * num_restarts if raw_samples is None else raw_samples,
+        options=optimize_options,
         inequality_constraints=inequality_constraints,
         fixed_features=fixed_features,
         post_processing_func=rounding_func,
@@ -295,14 +549,14 @@ def scipy_optimizer_list(
 
 
 def pareto_frontier_evaluator(
-    model: TorchModel,
+    model: TorchModel | None,
     objective_weights: Tensor,
-    objective_thresholds: Optional[Tensor] = None,
-    X: Optional[Tensor] = None,
-    Y: Optional[Tensor] = None,
-    Yvar: Optional[Tensor] = None,
-    outcome_constraints: Optional[Tuple[Tensor, Tensor]] = None,
-) -> Tuple[Tensor, Tensor, Tensor]:
+    objective_thresholds: Tensor | None = None,
+    X: Tensor | None = None,
+    Y: Tensor | None = None,
+    Yvar: Tensor | None = None,
+    outcome_constraints: tuple[Tensor, Tensor] | None = None,
+) -> tuple[Tensor, Tensor, Tensor]:
     """Return outcomes predicted to lie on a pareto frontier.
 
     Given a model and points to evaluate, use the model to predict which points
@@ -331,8 +585,10 @@ def pareto_frontier_evaluator(
             cov[j, m1, m2] is Cov[m1@j, m2@j].
         - A `j` tensor of the index of each frontier point in the input Y.
     """
+    # TODO: better input validation, making more explicit whether we are using
+    # model predictions or not
     if X is not None:
-        Y, Yvar = model.predict(X)
+        Y, Yvar = none_throws(model).predict(X)
         # model.predict returns cpu tensors
         Y = Y.to(X.device)
         Yvar = Yvar.to(X.device)
@@ -375,8 +631,13 @@ def pareto_frontier_evaluator(
     # Get feasible points that do not violate outcome_constraints
     if outcome_constraints is not None:
         cons_tfs = get_outcome_constraint_transforms(outcome_constraints)
+        # Handle NaNs in Y, if those elements are not part of the constraints.
+        # By setting the unused elements to 0, we prevent them from marking
+        # the whole constraint value as NaN and evaluating to infeasible.
+        Y_cons = Y.clone()
+        Y_cons[..., (outcome_constraints[0] == 0).all(dim=0)] = 0
         # pyre-ignore [16]
-        feas = torch.stack([c(Y) <= 0 for c in cons_tfs], dim=-1).all(dim=-1)
+        feas = torch.stack([c(Y_cons) <= 0 for c in cons_tfs], dim=-1).all(dim=-1)
         Y = Y[feas]
         Yvar = Yvar[feas]
         Y_obj = Y_obj[feas]
@@ -400,13 +661,14 @@ def pareto_frontier_evaluator(
 def infer_objective_thresholds(
     model: Model,
     objective_weights: Tensor,  # objective_directions
-    bounds: Optional[List[Tuple[float, float]]] = None,
-    outcome_constraints: Optional[Tuple[Tensor, Tensor]] = None,
-    linear_constraints: Optional[Tuple[Tensor, Tensor]] = None,
-    fixed_features: Optional[Dict[int, float]] = None,
-    subset_idcs: Optional[Tensor] = None,
-    Xs: Optional[List[Tensor]] = None,
-    X_observed: Optional[Tensor] = None,
+    bounds: list[tuple[float, float]] | None = None,
+    outcome_constraints: tuple[Tensor, Tensor] | None = None,
+    linear_constraints: tuple[Tensor, Tensor] | None = None,
+    fixed_features: dict[int, float] | None = None,
+    subset_idcs: Tensor | None = None,
+    Xs: list[Tensor] | None = None,
+    X_observed: Tensor | None = None,
+    objective_thresholds: Tensor | None = None,
 ) -> Tensor:
     """Infer objective thresholds.
 
@@ -441,6 +703,11 @@ def infer_objective_thresholds(
             vary from i=1,...,m.
         X_observed: A `n x d`-dim tensor of in-sample points to use for
             determining the current in-sample Pareto frontier.
+        objective_thresholds: Any known objective thresholds to pass to
+            `infer_reference_point` heuristic. This should not be subsetted.
+            If only a subset of the objectives have known thresholds, the
+            remaining objectives should be NaN. If no objective threshold
+            was provided, this can be `None`.
 
     Returns:
         A `m`-dim tensor of objective thresholds, where the objective
@@ -461,34 +728,19 @@ def infer_objective_thresholds(
         )
     num_outcomes = objective_weights.shape[0]
     if subset_idcs is None:
-        # check if only a subset of outcomes are modeled
-        nonzero = objective_weights != 0
-        if outcome_constraints is not None:
-            A, _ = outcome_constraints
-            nonzero = nonzero | torch.any(A != 0, dim=0)
-        expected_subset_idcs = nonzero.nonzero().view(-1)
-        if model.num_outputs > expected_subset_idcs.numel():
-            # subset the model so that we only compute the posterior
-            # over the relevant outcomes
-            subset_model_results = subset_model(
-                model=model,
-                objective_weights=objective_weights,
-                outcome_constraints=outcome_constraints,
-            )
-            model = subset_model_results.model
-            objective_weights = subset_model_results.objective_weights
-            outcome_constraints = subset_model_results.outcome_constraints
-            subset_idcs = subset_model_results.indices
-        else:
-            # model is already subsetted.
-            subset_idcs = expected_subset_idcs
-            # subset objective weights and outcome constraints
-            objective_weights = objective_weights[subset_idcs]
-            if outcome_constraints is not None:
-                outcome_constraints = (
-                    outcome_constraints[0][:, subset_idcs],
-                    outcome_constraints[1],
-                )
+        # Subset the model so that we only compute the posterior
+        # over the relevant outcomes.
+        # This is a no-op if the model is already only modeling
+        # the relevant outcomes.
+        subset_model_results = subset_model(
+            model=model,
+            objective_weights=objective_weights,
+            outcome_constraints=outcome_constraints,
+        )
+        model = subset_model_results.model
+        objective_weights = subset_model_results.objective_weights
+        outcome_constraints = subset_model_results.outcome_constraints
+        subset_idcs = subset_model_results.indices
     else:
         objective_weights = objective_weights[subset_idcs]
         if outcome_constraints is not None:
@@ -497,20 +749,29 @@ def infer_objective_thresholds(
                 outcome_constraints[1],
             )
     with torch.no_grad():
-        pred = not_none(model).posterior(not_none(X_observed)).mean
+        pred = _check_posterior_type(
+            none_throws(model).posterior(none_throws(X_observed))
+        ).mean
+
     if outcome_constraints is not None:
         cons_tfs = get_outcome_constraint_transforms(outcome_constraints)
         # pyre-ignore [16]
         feas = torch.stack([c(pred) <= 0 for c in cons_tfs], dim=-1).all(dim=-1)
         pred = pred[feas]
     if pred.shape[0] == 0:
-        raise AxError("There are no feasible observed points.")
+        raise AxError(NO_FEASIBLE_POINTS_MESSAGE)
     obj_mask = objective_weights.nonzero().view(-1)
     obj_weights_subset = objective_weights[obj_mask]
     obj = pred[..., obj_mask] * obj_weights_subset
     pareto_obj = obj[is_non_dominated(obj)]
+    # If objective thresholds are provided, set max_ref_point accordingly.
+    if objective_thresholds is not None:
+        max_ref_point = objective_thresholds[obj_mask] * obj_weights_subset
+    else:
+        max_ref_point = None
     objective_thresholds = infer_reference_point(
         pareto_Y=pareto_obj,
+        max_ref_point=max_ref_point,
         scale=0.1,
     )
     # multiply by objective weights to return objective thresholds in the
@@ -525,3 +786,15 @@ def infer_objective_thresholds(
     obj_idcs = subset_idcs[obj_mask]
     full_objective_thresholds[obj_idcs] = objective_thresholds.clone()
     return full_objective_thresholds
+
+
+def _check_posterior_type(
+    posterior: Posterior,
+) -> GPyTorchPosterior | PosteriorList:
+    """Check whether the posterior type is  `GPyTorchPosterior` or `PosteriorList`."""
+    if isinstance(posterior, GPyTorchPosterior) or isinstance(posterior, PosteriorList):
+        return posterior
+    else:
+        raise ValueError(
+            f"Value was not of type GPyTorchPosterior or PosteriorList:\n{posterior}"
+        )

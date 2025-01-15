@@ -4,21 +4,24 @@
 # This source code is licensed under the MIT license found in the
 # LICENSE file in the root directory of this source tree.
 
+# pyre-strict
+
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import Any, Dict, Iterable, Optional, Set, TYPE_CHECKING
+from collections.abc import Iterable
+from typing import Any, TYPE_CHECKING
 
 from ax.utils.common.base import Base
-from ax.utils.common.serialization import extract_init_args, serialize_init_args
+from ax.utils.common.serialization import SerializationMixin
 
 
-if TYPE_CHECKING:  # pragma: no cover
+if TYPE_CHECKING:
     # import as module to make sphinx-autodoc-typehints happy
     from ax import core  # noqa F401
 
 
-class Runner(Base, ABC):
+class Runner(Base, SerializationMixin, ABC):
     """Abstract base class for custom runner classes"""
 
     @property
@@ -26,22 +29,15 @@ class Runner(Base, ABC):
         """Whether the trial goes to staged or running state once deployed."""
         return False
 
-    @classmethod
-    def serialize_init_args(cls, runner: Runner) -> Dict[str, Any]:
-        """Serialize the properties needed to initialize the runner.
-        Used for storage.
-        """
-        return serialize_init_args(object=runner)
-
-    @classmethod
-    def deserialize_init_args(cls, args: Dict[str, Any]) -> Dict[str, Any]:
-        """Given a dictionary, deserialize the properties needed to initialize the runner.
-        Used for storage.
-        """
-        return extract_init_args(args=args, class_=cls)
+    @property
+    def run_metadata_report_keys(self) -> list[str]:
+        """A list of keys of the metadata dict returned by `run()` that are
+        relevant outside the runner-internal impolementation. These can e.g.
+        be reported in `Scheduler.report_results()`."""
+        return []
 
     @abstractmethod
-    def run(self, trial: core.base_trial.BaseTrial) -> Dict[str, Any]:
+    def run(self, trial: core.base_trial.BaseTrial) -> dict[str, Any]:
         """Deploys a trial based on custom runner subclass implementation.
 
         Args:
@@ -50,11 +46,11 @@ class Runner(Base, ABC):
         Returns:
             Dict of run metadata from the deployment process.
         """
-        pass  # pragma: no cover
+        pass
 
     def run_multiple(
         self, trials: Iterable[core.base_trial.BaseTrial]
-    ) -> Dict[int, Dict[str, Any]]:
+    ) -> dict[int, dict[str, Any]]:
         """Runs a single evaluation for each of the given trials. Useful when deploying
         multiple trials at once is more efficient than deploying them one-by-one.
         Used in Ax ``Scheduler``.
@@ -96,7 +92,7 @@ class Runner(Base, ABC):
 
     def poll_trial_status(
         self, trials: Iterable[core.base_trial.BaseTrial]
-    ) -> Dict[core.base_trial.TrialStatus, Set[int]]:
+    ) -> dict[core.base_trial.TrialStatus, set[int]]:
         """Checks the status of any non-terminal trials and returns their
         indices as a mapping from TrialStatus to a list of indices. Required
         for runners used with Ax ``Scheduler``.
@@ -118,9 +114,23 @@ class Runner(Base, ABC):
             "method."
         )
 
+    def poll_exception(self, trial: core.base_trial.BaseTrial) -> str:
+        """Returns the exception from a trial.
+
+        Args:
+            trial: Trial to get exception for.
+
+        Returns:
+            Exception string.
+        """
+        raise NotImplementedError(
+            f"{self.__class__.__name__} does not implement a `poll_exception` "
+            "method."
+        )
+
     def stop(
-        self, trial: core.base_trial.BaseTrial, reason: Optional[str] = None
-    ) -> Dict[str, Any]:
+        self, trial: core.base_trial.BaseTrial, reason: str | None = None
+    ) -> dict[str, Any]:
         """Stop a trial based on custom runner subclass implementation.
 
         Optional method.
@@ -141,5 +151,12 @@ class Runner(Base, ABC):
         cls = type(self)
         # pyre-ignore[45]: Cannot instantiate abstract class `Runner`.
         return cls(
-            **serialize_init_args(self),
+            **cls.deserialize_init_args(args=cls.serialize_init_args(obj=self)),
         )
+
+    def __eq__(self, other: Runner) -> bool:
+        same_class = self.__class__ == other.__class__
+        same_init_args = self.serialize_init_args(
+            obj=self
+        ) == other.serialize_init_args(obj=other)
+        return same_class and same_init_args

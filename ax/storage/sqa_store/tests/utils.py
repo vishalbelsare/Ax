@@ -4,6 +4,8 @@
 # This source code is licensed under the MIT license found in the
 # LICENSE file in the root directory of this source tree.
 
+# pyre-strict
+
 from ax.storage.sqa_store.decoder import Decoder
 from ax.storage.sqa_store.encoder import Encoder
 from ax.utils.testing.core_stubs import (
@@ -25,6 +27,7 @@ from ax.utils.testing.core_stubs import (
     get_generator_run,
     get_generator_run2,
     get_hartmann_metric,
+    get_hierarchical_search_space_experiment,
     get_metric,
     get_objective,
     get_order_constraint,
@@ -32,6 +35,9 @@ from ax.utils.testing.core_stubs import (
     get_outcome_constraint,
     get_parameter_constraint,
     get_range_parameter,
+    get_risk_measure,
+    get_robust_search_space,
+    get_robust_search_space_environmental,
     get_scalarized_objective,
     get_scalarized_outcome_constraint,
     get_sum_constraint1,
@@ -42,6 +48,7 @@ from ax.utils.testing.core_stubs import (
 )
 
 
+# pyre-fixme[5]: Global expression must be annotated.
 TEST_CASES = [
     (
         "AbandonedArm",
@@ -119,6 +126,12 @@ TEST_CASES = [
         Decoder.experiment_from_sqa,
     ),
     (
+        "Experiment",
+        get_hierarchical_search_space_experiment,
+        Encoder.experiment_to_sqa,
+        Decoder.experiment_from_sqa,
+    ),
+    (
         "FixedParameter",
         get_fixed_parameter,
         Encoder.parameter_to_sqa,
@@ -148,25 +161,13 @@ TEST_CASES = [
         Encoder.metric_to_sqa,
         Decoder.metric_from_sqa,
     ),
+    ("Metric", get_metric, Encoder.metric_to_sqa, Decoder.metric_from_sqa),
+    ("Objective", get_objective, Encoder.objective_to_sqa, Decoder.metric_from_sqa),
     (
         "OrderConstraint",
         get_order_constraint,
         Encoder.parameter_constraint_to_sqa,
         Decoder.parameter_constraint_from_sqa,
-    ),
-    (
-        "ParameterConstraint",
-        get_parameter_constraint,
-        Encoder.parameter_constraint_to_sqa,
-        Decoder.parameter_constraint_from_sqa,
-    ),
-    ("Metric", get_metric, Encoder.metric_to_sqa, Decoder.metric_from_sqa),
-    ("Objective", get_objective, Encoder.objective_to_sqa, Decoder.metric_from_sqa),
-    (
-        "ScalarizedObjective",
-        get_scalarized_objective,
-        Encoder.objective_to_sqa,
-        Decoder.metric_from_sqa,
     ),
     (
         "OutcomeConstraint",
@@ -175,16 +176,48 @@ TEST_CASES = [
         Decoder.metric_from_sqa,
     ),
     (
-        "ScalarizedOutcomeConstraint",
-        get_scalarized_outcome_constraint,
-        Encoder.outcome_constraint_to_sqa,
-        Decoder.metric_from_sqa,
+        "ParameterConstraint",
+        get_parameter_constraint,
+        Encoder.parameter_constraint_to_sqa,
+        Decoder.parameter_constraint_from_sqa,
     ),
     (
         "RangeParameter",
         get_range_parameter,
         Encoder.parameter_to_sqa,
         Decoder.parameter_from_sqa,
+    ),
+    (
+        "RiskMeasure",
+        get_risk_measure,
+        Encoder.risk_measure_to_sqa,
+        Decoder.metric_from_sqa,
+    ),
+    (
+        "RobustSearchSpace",
+        get_robust_search_space,
+        # Using generic search space methods for full-stack test coverage.
+        Encoder.search_space_to_sqa,
+        Decoder.search_space_from_sqa,
+    ),
+    (
+        "RobustSearchSpace",
+        get_robust_search_space_environmental,
+        # Using generic search space methods for full-stack test coverage.
+        Encoder.search_space_to_sqa,
+        Decoder.search_space_from_sqa,
+    ),
+    (
+        "ScalarizedObjective",
+        get_scalarized_objective,
+        Encoder.objective_to_sqa,
+        Decoder.metric_from_sqa,
+    ),
+    (
+        "ScalarizedOutcomeConstraint",
+        get_scalarized_outcome_constraint,
+        Encoder.outcome_constraint_to_sqa,
+        Decoder.metric_from_sqa,
     ),
     (
         "SyntheticRunner",

@@ -4,49 +4,61 @@
 # This source code is licensed under the MIT license found in the
 # LICENSE file in the root directory of this source tree.
 
+# pyre-strict
+
 from copy import deepcopy
 from itertools import combinations
-from typing import Dict, List, NamedTuple, Optional, Tuple, Union
+from logging import Logger
+from typing import NamedTuple
 
 import numpy as np
+import numpy.typing as npt
 import torch
 from ax.core.batch_trial import BatchTrial
 from ax.core.data import Data
 from ax.core.experiment import Experiment
 from ax.core.metric import Metric
-from ax.core.objective import ScalarizedObjective
+from ax.core.objective import MultiObjective, ScalarizedObjective
 from ax.core.observation import ObservationFeatures
 from ax.core.optimization_config import MultiObjectiveOptimizationConfig
-from ax.core.outcome_constraint import OutcomeConstraint
+from ax.core.outcome_constraint import (
+    ComparisonOp,
+    ObjectiveThreshold,
+    OutcomeConstraint,
+)
+from ax.core.search_space import RobustSearchSpace, SearchSpace
 from ax.core.types import TParameterization
-from ax.exceptions.core import AxError, UnsupportedError
-from ax.modelbridge.modelbridge_utils import observed_pareto_frontier
+from ax.exceptions.core import AxError, UnsupportedError, UserInputError
+from ax.modelbridge.modelbridge_utils import (
+    _get_modelbridge_training_data,
+    get_pareto_frontier_and_configs,
+    observed_pareto_frontier,
+)
 from ax.modelbridge.registry import Models
 from ax.modelbridge.torch import TorchModelBridge
-from ax.modelbridge.transforms.choice_encode import OrderedChoiceEncode
-from ax.modelbridge.transforms.derelativize import Derelativize
-from ax.modelbridge.transforms.int_to_float import IntToFloat
-from ax.modelbridge.transforms.search_space_to_choice import SearchSpaceToChoice
-from ax.models.torch.posterior_mean import get_PosteriorMean
+from ax.modelbridge.transforms.derelativize import derelativize_bound
+from ax.modelbridge.transforms.search_space_to_float import SearchSpaceToFloat
 from ax.models.torch_base import TorchModel
 from ax.utils.common.logger import get_logger
+from ax.utils.common.typeutils import checked_cast
 from ax.utils.stats.statstools import relativize
+from botorch.acquisition.monte_carlo import qSimpleRegret
 from botorch.utils.multi_objective import is_non_dominated
-
+from botorch.utils.multi_objective.hypervolume import infer_reference_point
 
 # type aliases
-Mu = Dict[str, List[float]]
-Cov = Dict[str, Dict[str, List[float]]]
+Mu = dict[str, list[float]]
+Cov = dict[str, dict[str, list[float]]]
 
 
-logger = get_logger(__name__)
+logger: Logger = get_logger(__name__)
 
 
 def _extract_observed_pareto_2d(
-    Y: np.ndarray,
-    reference_point: Optional[Tuple[float, float]],
-    minimize: Union[bool, Tuple[bool, bool]] = True,
-) -> np.ndarray:
+    Y: npt.NDArray,
+    reference_point: tuple[float, float] | None,
+    minimize: bool | tuple[bool, bool] = True,
+) -> npt.NDArray:
     if Y.shape[1] != 2:
         raise NotImplementedError("Currently only the 2-dim case is handled.")
     # If `minimize` is a bool, apply to both dimensions
@@ -97,28 +109,71 @@ class ParetoFrontierResults(NamedTuple):
     - arm_names: Optional list of arm names for each parameterization.
     """
 
-    param_dicts: List[TParameterization]
-    means: Dict[str, List[float]]
-    sems: Dict[str, List[float]]
+    param_dicts: list[TParameterization]
+    means: dict[str, list[float]]
+    sems: dict[str, list[float]]
     primary_metric: str
     secondary_metric: str
-    absolute_metrics: List[str]
-    objective_thresholds: Optional[Dict[str, float]]
-    arm_names: Optional[List[Optional[str]]]
+    absolute_metrics: list[str]
+    objective_thresholds: dict[str, float] | None
+    arm_names: list[str | None] | None
+
+
+def _extract_sq_data(
+    experiment: Experiment, data: Data
+) -> tuple[dict[str, float], dict[str, float]]:
+    """
+    Returns sq_means and sq_sems, each a mapping from metric name to, respectively, mean
+    and sem of the status quo arm. Empty dictionaries if no SQ arm.
+    """
+    sq_means = {}
+    sq_sems = {}
+    if experiment.status_quo is not None:
+        # Extract SQ values
+        sq_df = data.df[
+            data.df["arm_name"] == experiment.status_quo.name  # pyre-ignore
+        ]
+        for metric, metric_df in sq_df.groupby("metric_name"):
+            sq_means[metric] = metric_df["mean"].values[0]
+            sq_sems[metric] = metric_df["sem"].values[0]
+    return sq_means, sq_sems
+
+
+def _relativize_values(
+    means: list[float], sq_mean: float, sems: list[float], sq_sem: float
+) -> tuple[list[float], list[float]]:
+    """
+    Relativize values, using delta method if SEMs provided, or just by relativizing
+    means if not. Relativization is as percent.
+    """
+    if np.isnan(sq_sem) or np.isnan(sems).any():
+        # Just relativize means
+        means = [(mu / sq_mean - 1) * 100 for mu in means]
+    else:
+        # Use delta method
+        means_arr, sems_arr = relativize(
+            means_t=np.array(means),
+            sems_t=np.array(sems),
+            mean_c=sq_mean,
+            sem_c=sq_sem,
+            as_percent=True,
+        )
+        means, sems = list(means), list(sems)
+    return means, sems
 
 
 def get_observed_pareto_frontiers(
     experiment: Experiment,
-    data: Optional[Data] = None,
-    rel: bool = True,
-    arm_names: Optional[List[str]] = None,
-) -> List[ParetoFrontierResults]:
+    data: Data | None = None,
+    rel: bool | None = None,
+    arm_names: list[str] | None = None,
+) -> list[ParetoFrontierResults]:
     """
     Find all Pareto points from an experiment.
 
     Uses only values as observed in the data; no modeling is involved. Makes no
     assumption about the search space or types of parameters. If "data" is provided will
-    use that, otherwise will use all data attached to the experiment.
+    use that, otherwise will use all data already attached to the experiment.
 
     Uses all arms present in data; does not filter according to experiment
     search space. If arm_names is specified, will filter to just those arm whose names
@@ -132,19 +187,27 @@ def get_observed_pareto_frontiers(
 
     Args:
         experiment: The experiment.
-        data: Data to use for computing Pareto frontier. If not provided, will fetch
+        data: Data to use for computing Pareto frontier. If not provided, will lookup
             data from experiment.
-        rel: Relativize, if status quo on experiment.
+        rel: Relativize results wrt experiment status quo. If None, then rel will be
+            taken for each objective separately from its own objective threshold.
+            `rel` must be specified if there are missing objective thresholds.
         arm_names: If provided, computes Pareto frontier only from among the provided
-            list of arm names.
+            list of arm names, plus status quo if set on experiment.
 
     Returns: ParetoFrontierResults that can be used with interact_pareto_frontier.
     """
     if data is None:
-        data = experiment.fetch_data()
+        data = experiment.lookup_data()
     if experiment.optimization_config is None:
         raise ValueError("Experiment must have an optimization config")
     if arm_names is not None:
+        if (
+            experiment.status_quo is not None
+            and experiment.status_quo.name not in arm_names
+        ):
+            # Make sure status quo is always included, for derelativization
+            arm_names.append(experiment.status_quo.name)
         data = Data(data.df[data.df["arm_name"].isin(arm_names)])
     mb = get_tensor_converter_model(experiment=experiment, data=data)
     pareto_observations = observed_pareto_frontier(modelbridge=mb)
@@ -163,51 +226,56 @@ def get_observed_pareto_frontiers(
                 pfr_means[name].append(obs.data.means[i])
                 pfr_sems[name].append(np.sqrt(obs.data.covariance[i, i]))
 
-    # Relativize as needed
-    if rel and experiment.status_quo is not None:
-        # Get status quo values
-        # pyre-fixme[16]: `Optional` has no attribute `name`.
-        sq_df = data.df[data.df["arm_name"] == experiment.status_quo.name]
-        sq_df = sq_df.to_dict(orient="list")
-        sq_means = {}
-        sq_sems = {}
-        # pyre-fixme[6]: Expected `_SupportsIndex` for 1st param but got `str`.
-        for i, metric in enumerate(sq_df["metric_name"]):
-            # pyre-fixme[6]: Expected `_SupportsIndex` for 1st param but got `str`.
-            sq_means[metric] = sq_df["mean"][i]
-            # pyre-fixme[6]: Expected `_SupportsIndex` for 1st param but got `str`.
-            sq_sems[metric] = sq_df["sem"][i]
-        # Relativize
-        for name in pfr_means:
-            if np.isnan(sq_sems[name]) or np.isnan(pfr_sems[name]).any():
-                # Just relativize means
-                pfr_means[name] = [
-                    (mu / sq_means[name] - 1) * 100 for mu in pfr_means[name]
-                ]
-            else:
-                # Use delta method
-                pfr_means[name], pfr_sems[name] = relativize(
-                    means_t=pfr_means[name],
-                    sems_t=pfr_sems[name],
-                    mean_c=sq_means[name],
-                    sem_c=sq_sems[name],
-                    as_percent=True,
-                )
-        absolute_metrics = []
-    else:
-        absolute_metrics = obj_metr_list
-
+    # Get objective thresholds
+    rel_objth = {}
     objective_thresholds = {}
     if experiment.optimization_config.objective_thresholds is not None:  # pyre-ignore
         for objth in experiment.optimization_config.objective_thresholds:
-            is_rel = objth.metric.name not in absolute_metrics
-            if objth.relative != is_rel:
-                raise ValueError(
-                    f"Objective threshold for {objth.metric.name} has "
-                    f"rel={objth.relative} but was specified here as rel={is_rel}"
-                )
+            rel_objth[objth.metric.name] = objth.relative
             objective_thresholds[objth.metric.name] = objth.bound
 
+    # Identify which metrics should be relativized
+    if rel in [True, False]:
+        metric_is_rel = {name: rel for name in pfr_means}
+    else:
+        if len(rel_objth) != len(pfr_means):
+            raise UserInputError(
+                "At least one objective is missing an objective threshold. "
+                "`rel` must be specified as True or False when there are missing "
+                "objective thresholds."
+            )
+        # Default to however the threshold is specified
+        metric_is_rel = rel_objth
+
+    # Compute SQ values
+    sq_means, sq_sems = _extract_sq_data(experiment, data)
+
+    # Relativize data and thresholds as needed
+    for name in pfr_means:
+        if metric_is_rel[name]:
+            pfr_means[name], pfr_sems[name] = _relativize_values(
+                means=pfr_means[name],
+                sq_mean=sq_means[name],
+                sems=pfr_sems[name],
+                sq_sem=sq_sems[name],
+            )
+            if name in objective_thresholds and not rel_objth[name]:
+                # Metric is rel but obj th is not.
+                # Need to relativize the objective threshold
+                objective_thresholds[name] = _relativize_values(
+                    means=[objective_thresholds[name]],
+                    sq_mean=sq_means[name],
+                    sems=[np.nan],
+                    sq_sem=np.nan,
+                )[0][0]
+        elif name in objective_thresholds and rel_objth[name]:
+            # Metric is not relative but objective threshold is, so we need to
+            # derelativize the objective threshold.
+            objective_thresholds[name] = derelativize_bound(
+                bound=objective_thresholds[name], sq_val=sq_means[name]
+            )
+
+    absolute_metrics = [name for name, val in metric_is_rel.items() if not val]
     # Construct ParetoFrontResults for each pair
     pfr_list = []
     param_dicts = [obs.features.parameters for obs in pareto_observations]
@@ -227,6 +295,22 @@ def get_observed_pareto_frontiers(
             )
         )
     return pfr_list
+
+
+def to_nonrobust_search_space(search_space: SearchSpace) -> SearchSpace:
+    """Reduces a RobustSearchSpace to a SearchSpace.
+
+    This is a no-op for all other search spaces.
+    """
+    if isinstance(search_space, RobustSearchSpace):
+        return SearchSpace(
+            parameters=[p.clone() for p in search_space._parameters.values()],
+            parameter_constraints=[
+                pc.clone() for pc in search_space._parameter_constraints
+            ],
+        )
+    else:
+        return search_space
 
 
 def get_tensor_converter_model(experiment: Experiment, data: Data) -> TorchModelBridge:
@@ -249,14 +333,10 @@ def get_tensor_converter_model(experiment: Experiment, data: Data) -> TorchModel
     # space to tensors.
     return TorchModelBridge(
         experiment=experiment,
-        search_space=experiment.search_space,
+        search_space=to_nonrobust_search_space(experiment.search_space),
         data=data,
         model=TorchModel(),
-        transforms=[Derelativize, SearchSpaceToChoice, OrderedChoiceEncode, IntToFloat],
-        transform_configs={
-            "Derelativize": {"use_raw_status_quo": True},
-            "SearchSpaceToChoice": {"use_ordered": True},
-        },
+        transforms=[SearchSpaceToFloat],
         fit_out_of_design=True,
     )
 
@@ -265,12 +345,11 @@ def compute_posterior_pareto_frontier(
     experiment: Experiment,
     primary_objective: Metric,
     secondary_objective: Metric,
-    data: Optional[Data] = None,
-    outcome_constraints: Optional[List[OutcomeConstraint]] = None,
-    absolute_metrics: Optional[List[str]] = None,
+    data: Data | None = None,
+    outcome_constraints: list[OutcomeConstraint] | None = None,
+    absolute_metrics: list[str] | None = None,
     num_points: int = 10,
-    trial_index: Optional[int] = None,
-    chebyshev: bool = True,
+    trial_index: int | None = None,
 ) -> ParetoFrontierResults:
     """Compute the Pareto frontier between two objectives. For experiments
     with batch trials, a trial index or data object must be provided.
@@ -291,16 +370,10 @@ def compute_posterior_pareto_frontier(
             will be in % relative to status_quo).
         num_points: The number of points to compute on the
             Pareto frontier.
-        chebyshev: Whether to use augmented_chebyshev_scalarization
-            when computing Pareto Frontier points.
 
     Returns:
         ParetoFrontierResults: A NamedTuple with fields listed in its definition.
     """
-    model_gen_options = {
-        "acquisition_function_kwargs": {"chebyshev_scalarization": chebyshev}
-    }
-
     if (
         trial_index is None
         and data is None
@@ -335,17 +408,25 @@ def compute_posterior_pareto_frontier(
         except Exception as e:
             logger.info(f"Could not fetch data from experiment or trial: {e}")
 
-    oc = _build_new_optimization_config(
-        weights=np.array([0.5, 0.5]),
+    # The weights here are just dummy weights that we pass in to construct the
+    # modelbridge. We set the weight to -1 if `lower_is_better` is `True` and
+    # 1 otherwise. This code would benefit from a serious revamp.
+    oc = _build_scalarized_optimization_config(
+        weights=np.array(
+            [
+                -1 if primary_objective.lower_is_better else 1,
+                -1 if secondary_objective.lower_is_better else 1,
+            ]
+        ),
         primary_objective=primary_objective,
         secondary_objective=secondary_objective,
         outcome_constraints=outcome_constraints,
     )
-    model = Models.MOO(
+    model = Models.BOTORCH_MODULAR(
         experiment=experiment,
         data=data,
-        acqf_constructor=get_PosteriorMean,
         optimization_config=oc,
+        botorch_acqf_class=qSimpleRegret,
     )
 
     status_quo = experiment.status_quo
@@ -355,7 +436,6 @@ def compute_posterior_pareto_frontier(
                 [
                     ObservationFeatures(
                         parameters=status_quo.parameters,
-                        # pyre-fixme [6]: Expected `Optional[np.int64]` for trial_index
                         trial_index=trial_index,
                     )
                 ]
@@ -367,7 +447,7 @@ def compute_posterior_pareto_frontier(
     else:
         status_quo_prediction = None
 
-    param_dicts: List[TParameterization] = []
+    param_dicts: list[TParameterization] = []
 
     # Construct weightings with linear angular spacing.
     # TODO: Verify whether 0, 1 weights cause problems because of subset_model.
@@ -379,16 +459,13 @@ def compute_posterior_pareto_frontier(
     weights_list = np.stack([primary_weight, secondary_weight]).transpose()
     for weights in weights_list:
         outcome_constraints = outcome_constraints
-        oc = _build_new_optimization_config(
+        oc = _build_scalarized_optimization_config(
             weights=weights,
             primary_objective=primary_objective,
             secondary_objective=secondary_objective,
             outcome_constraints=outcome_constraints,
         )
-        # TODO: (jej) T64002590 Let this serve as a starting point for optimization.
-        # ex. Add global spacing criterion. Implement on BoTorch side.
-        # pyre-fixme [6]: Expected different type for model_gen_options
-        run = model.gen(1, model_gen_options=model_gen_options, optimization_config=oc)
+        run = model.gen(1, optimization_config=oc)
         param_dicts.append(run.arms[0].parameters)
 
     # Call predict on points to get their decomposed metrics.
@@ -409,14 +486,14 @@ def compute_posterior_pareto_frontier(
 
 
 def _extract_pareto_frontier_results(
-    param_dicts: List[TParameterization],
+    param_dicts: list[TParameterization],
     means: Mu,
     variances: Cov,
     primary_metric: str,
     secondary_metric: str,
-    absolute_metrics: List[str],
-    outcome_constraints: Optional[List[OutcomeConstraint]],
-    status_quo_prediction: Optional[Tuple[Mu, Cov]],
+    absolute_metrics: list[str],
+    outcome_constraints: list[OutcomeConstraint] | None,
+    status_quo_prediction: tuple[Mu, Cov] | None,
 ) -> ParetoFrontierResults:
     """Extract prediction results into ParetoFrontierResults struture."""
     metrics = list(means.keys())
@@ -434,6 +511,8 @@ def _extract_pareto_frontier_results(
 
         for metric in metrics:
             if metric not in absolute_metrics and metric in sq_mean:
+                # pyre-fixme[6]: For 2nd argument expected `List[float]` but got
+                #  `ndarray[typing.Any, typing.Any]`.
                 means_out[metric], sems_out[metric] = relativize(
                     means_t=means_out[metric],
                     sems_t=sems_out[metric],
@@ -444,8 +523,10 @@ def _extract_pareto_frontier_results(
 
     return ParetoFrontierResults(
         param_dicts=param_dicts,
-        means={metric: means for metric, means in means_out.items()},
-        sems={metric: sems for metric, sems in sems_out.items()},
+        means=means_out,
+        # pyre-fixme[6]: For 3rd argument expected `Dict[str, List[float]]` but got
+        #  `Dict[str, ndarray[typing.Any, dtype[typing.Any]]]`.
+        sems=sems_out,
         primary_metric=primary_metric,
         secondary_metric=secondary_metric,
         absolute_metrics=absolute_metrics,
@@ -455,7 +536,7 @@ def _extract_pareto_frontier_results(
 
 
 def _validate_outcome_constraints(
-    outcome_constraints: List[OutcomeConstraint],
+    outcome_constraints: list[OutcomeConstraint],
     primary_objective: Metric,
     secondary_objective: Metric,
 ) -> None:
@@ -470,15 +551,187 @@ def _validate_outcome_constraints(
                 )
 
 
-def _build_new_optimization_config(
-    weights, primary_objective, secondary_objective, outcome_constraints=None
-):
+def _build_scalarized_optimization_config(
+    weights: npt.NDArray,
+    primary_objective: Metric,
+    secondary_objective: Metric,
+    outcome_constraints: list[OutcomeConstraint] | None = None,
+) -> MultiObjectiveOptimizationConfig:
     obj = ScalarizedObjective(
         metrics=[primary_objective, secondary_objective],
-        weights=weights,
+        weights=weights.tolist(),
         minimize=False,
     )
     optimization_config = MultiObjectiveOptimizationConfig(
         objective=obj, outcome_constraints=outcome_constraints
     )
     return optimization_config
+
+
+def infer_reference_point_from_experiment(
+    experiment: Experiment, data: Data
+) -> list[ObjectiveThreshold]:
+    """This functions is a wrapper around ``infer_reference_point`` to find the nadir
+    point from the pareto front of an experiment. Aside from converting experiment
+    to tensors, this wrapper transforms back and forth the objectives of the experiment
+    so that they are appropriately used by ``infer_reference_point``.
+
+    Args:
+        experiment: The experiment for which we want to infer the reference point.
+
+    Returns:
+        A list of objective thresholds representing the reference point.
+    """
+    if not experiment.is_moo_problem:
+        raise ValueError(
+            "This function works for MOO experiments only."
+            f" Experiment {experiment.name} is single objective."
+        )
+
+    # Reading experiment data.
+    mb_reference = get_tensor_converter_model(
+        experiment=experiment,
+        data=data,
+    )
+    obs_feats, obs_data, _ = _get_modelbridge_training_data(modelbridge=mb_reference)
+
+    # Since objectives could have arbitrary orders in objective_thresholds and
+    # further down the road `get_pareto_frontier_and_configs` arbitrarily changes the
+    # orders of the objectives, we fix the objective orders here based on the
+    # observation_data and maintain it throughout the flow.
+    objective_orders = obs_data[0].metric_names
+
+    # Defining a dummy reference point so that all observed points are considered
+    # when calculating the Pareto front. Also, defining a multiplier to turn all
+    # the objectives to be maximized. Note that the multiplier at this point
+    # contains 0 for outcome_constraint metrics, but this will be dropped later.
+    opt_config = checked_cast(
+        MultiObjectiveOptimizationConfig, experiment.optimization_config
+    )
+    inferred_rp = _get_objective_thresholds(optimization_config=opt_config)
+    multiplier = [0] * len(objective_orders)
+    if len(opt_config.objective_thresholds) > 0:
+        inferred_rp = deepcopy(opt_config.objective_thresholds)
+    else:
+        inferred_rp = []
+        for objective in checked_cast(MultiObjective, opt_config.objective).objectives:
+            ot = ObjectiveThreshold(
+                metric=objective.metric,
+                bound=0.0,  # dummy value
+                op=ComparisonOp.LEQ if objective.minimize else ComparisonOp.GEQ,
+                relative=False,
+            )
+            inferred_rp.append(ot)
+    for ot in inferred_rp:
+        # In the following, we find the index of the objective in
+        # `objective_orders`. If there is an objective that does not exist
+        # in `obs_data`, a ValueError is raised.
+        try:
+            objective_index = objective_orders.index(ot.metric.name)
+        except ValueError:
+            raise ValueError(f"Metric {ot.metric.name} does not exist in `obs_data`.")
+
+        if ot.op == ComparisonOp.LEQ:
+            ot.bound = np.inf
+            multiplier[objective_index] = -1
+        else:
+            ot.bound = -np.inf
+            multiplier[objective_index] = 1
+
+    # Finding the pareto frontier
+    frontier_observations, f, obj_w, _ = get_pareto_frontier_and_configs(
+        modelbridge=mb_reference,
+        observation_features=obs_feats,
+        observation_data=obs_data,
+        objective_thresholds=inferred_rp,
+        use_model_predictions=False,
+    )
+    if len(frontier_observations) == 0:
+        outcome_constraints = opt_config._outcome_constraints
+        if len(outcome_constraints) == 0:
+            raise RuntimeError(
+                "No frontier observations found in the experiment and no constraints "
+                "are present. Please check the data of the experiment."
+            )
+
+        logger.warning(
+            "No frontier observations found in the experiment. The likely cause is "
+            "the absence of feasible arms in the experiment if a constraint is present."
+            " Trying to find a reference point with the unconstrained objective values."
+        )
+
+        opt_config._outcome_constraints = []  # removing the constraints
+        # getting the unconstrained pareto frontier
+        frontier_observations, f, obj_w, _ = get_pareto_frontier_and_configs(
+            modelbridge=mb_reference,
+            observation_features=obs_feats,
+            observation_data=obs_data,
+            objective_thresholds=inferred_rp,
+            use_model_predictions=False,
+        )
+        # restoring constraints
+        opt_config._outcome_constraints = outcome_constraints
+
+    # Need to reshuffle columns of `f` and `obj_w` to be consistent
+    # with objective_orders.
+    order = [
+        objective_orders.index(metric_name)
+        for metric_name in frontier_observations[0].data.metric_names
+    ]
+    f = f[:, order]
+    obj_w = obj_w[order]
+
+    # Dropping the columns related to outcome constraints.
+    f = f[:, obj_w.nonzero().view(-1)]
+    multiplier_tensor = torch.tensor(multiplier, dtype=f.dtype, device=f.device)
+    multiplier_nonzero = multiplier_tensor[obj_w.nonzero().view(-1)]
+
+    # Transforming all the objectives to be maximized.
+    f_transformed = multiplier_nonzero * f
+
+    # Finding nadir point.
+    rp_raw = infer_reference_point(f_transformed)
+
+    # Un-transforming the reference point.
+    rp = multiplier_nonzero * rp_raw
+
+    # Removing the non-objective metrics form the order.
+    objective_orders_reduced = [
+        x for (i, x) in enumerate(objective_orders) if multiplier[i] != 0
+    ]
+
+    for obj_threshold in inferred_rp:
+        obj_threshold.bound = rp[
+            objective_orders_reduced.index(obj_threshold.metric.name)
+        ].item()
+    return inferred_rp
+
+
+def _get_objective_thresholds(
+    optimization_config: MultiObjectiveOptimizationConfig,
+) -> list[ObjectiveThreshold]:
+    """Get objective thresholds for an optimization config.
+
+    This will return objective thresholds with dummy values if there are
+    no objective thresholds on the optimization config.
+
+    Args:
+        optimization_config: Optimization config.
+
+    Returns:
+        List of objective thresholds.
+    """
+    if optimization_config.objective_thresholds is not None:
+        return deepcopy(optimization_config.objective_thresholds)
+    objective_thresholds = []
+    for objective in checked_cast(
+        MultiObjective, optimization_config.objective
+    ).objectives:
+        ot = ObjectiveThreshold(
+            metric=objective.metric,
+            bound=0.0,  # dummy value
+            op=ComparisonOp.LEQ if objective.minimize else ComparisonOp.GEQ,
+            relative=False,
+        )
+        objective_thresholds.append(ot)
+    return objective_thresholds

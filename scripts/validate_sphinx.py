@@ -12,21 +12,25 @@ from typing import Set
 
 
 # Paths are relative to top-level Ax directory (which is passed into fxn below)
-SPHINX_RST_PATH = os.path.join("sphinx", "source")
+SPHINX_RST_PATH = os.path.join("github", "sphinx", "source")
+
 AX_LIBRARY_PATH = "ax"
+
+# Different because of ShipIt config
+OSS_SPHINX_RST_PATH = os.path.join("sphinx", "source")
+
 
 # Regex for automodule directive used in Sphinx docs
 AUTOMODULE_REGEX = re.compile(r"\.\. automodule:: ([\.\w]*)")
 
 # Modules to exclude from validation
 EXCLUDE_MODULES = {
-    "ax.utils.testing.doctest",
-    "ax.utils.testing.fully_annotated",
     "ax.utils.testing.manifest",
-    "ax.utils.testing.pyre_strict",
 }
 
 
+# NOTE: Can't use set[str] here due to internal call site of this module
+# on an ancient (<py3.9) python version.
 def parse_rst(rst_filename: str) -> Set[str]:
     """Extract automodule directives from rst."""
     ret = set()
@@ -48,6 +52,8 @@ def validate_complete_sphinx(path_to_ax: str) -> None:
     * Every single non-package (i.e. py file) module should be included in rst file with
       `automodule::` directive. Sphinx will then automatically include all members from
        the module in the documentation.
+    * The files are located in the github/sphinx/source folder. If this is failing,
+      ensure your file/module is present in the correct location in that folder.
 
     Note: this function does not validate any documentation for the 'ax' module.
 
@@ -62,15 +68,26 @@ def validate_complete_sphinx(path_to_ax: str) -> None:
         for importer, modname, ispkg in pkgutil.walk_packages(
             path=[AX_LIBRARY_PATH], onerror=lambda x: None
         )
-        if modname not in {"fb", "version"}
+        if modname not in {"fb", "version", "__version__"}
     }
 
     # Load all rst files (these contain the documentation for Sphinx)
-    rstpath = os.path.join(path_to_ax, SPHINX_RST_PATH)
-    rsts = {f.replace(".rst", "") for f in os.listdir(rstpath) if f.endswith(".rst")}
+    try:
+        rstpath = os.path.join(path_to_ax, SPHINX_RST_PATH)
+        rsts = {
+            f.replace(".rst", "") for f in os.listdir(rstpath) if f.endswith(".rst")
+        }
+    except FileNotFoundError:
+        rstpath = os.path.join(path_to_ax, OSS_SPHINX_RST_PATH)
+        rsts = {
+            f.replace(".rst", "") for f in os.listdir(rstpath) if f.endswith(".rst")
+        }
 
     # Verify that all top-level modules have a corresponding rst
-    assert len(modules.difference(rsts)) == 0, "Not all modules have corresponding rst."
+    modules_without_rsts = modules.difference(rsts)
+    assert (
+        len(modules_without_rsts) == 0
+    ), f"Not all modules have corresponding rst: {modules_without_rsts}"
 
     # Track all modules that are not in docs (so can print all)
     modules_not_in_docs = []

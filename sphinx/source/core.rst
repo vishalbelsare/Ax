@@ -2,26 +2,17 @@
     :class: hidden-section
 
 ax.core
-===================================
+=======
 
 .. automodule:: ax.core
 .. currentmodule:: ax.core
 
 
 Core Classes
--------------
-
-`AbstractData`
-~~~~~~~~~~~~~~~~~~~~~~~
-
-.. automodule:: ax.core.abstract_data
-    :members:
-    :undoc-members:
-    :show-inheritance:
-    :noindex:
+------------
 
 `Arm`
-~~~~~~~~~~~~~~~~~~~~~~~
+~~~~~
 
 .. automodule:: ax.core.arm
     :members:
@@ -37,7 +28,7 @@ Core Classes
     :show-inheritance:
 
 `BatchTrial`
-~~~~~~~~~~~~~
+~~~~~~~~~~~~
 
 .. automodule:: ax.core.batch_trial
     :members:
@@ -45,7 +36,7 @@ Core Classes
     :show-inheritance:
 
 `Data`
-~~~~~~~~~~
+~~~~~~
 
 .. automodule:: ax.core.data
     :members:
@@ -54,9 +45,26 @@ Core Classes
     :noindex:
 
 `Experiment`
-~~~~~~~~~~~~~~~~
+~~~~~~~~~~~~
 
 .. automodule:: ax.core.experiment
+    :members:
+    :undoc-members:
+    :show-inheritance:
+
+
+`AuxiliaryExperiment`
+~~~~~~~~~~~~
+
+.. automodule:: ax.core.auxiliary
+    :members:
+    :undoc-members:
+    :show-inheritance:
+
+`GenerationStrategyInterface`
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+.. automodule:: ax.core.generation_strategy_interface
     :members:
     :undoc-members:
     :show-inheritance:
@@ -70,7 +78,7 @@ Core Classes
     :show-inheritance:
 
 `MapData`
-~~~~~~~~~~~~~~
+~~~~~~~~~
 
 .. automodule:: ax.core.map_data
     :members:
@@ -79,7 +87,7 @@ Core Classes
     :noindex:
 
 `MapMetric`
-~~~~~~~~~~~~~~
+~~~~~~~~~~~
 
 .. automodule:: ax.core.map_metric
     :members:
@@ -88,7 +96,7 @@ Core Classes
     :noindex:
 
 `Metric`
-~~~~~~~~~~~~~~
+~~~~~~~~
 
 .. automodule:: ax.core.metric
     :members:
@@ -104,8 +112,8 @@ Core Classes
     :undoc-members:
     :show-inheritance:
 
-Objective
-~~~~~~~~~~~~~~~~~
+`Objective`
+~~~~~~~~~~~
 
 .. automodule:: ax.core.objective
     :members:
@@ -114,7 +122,7 @@ Objective
     :noindex:
 
 `Observation`
-~~~~~~~~~~~~~~
+~~~~~~~~~~~~~
 
 .. automodule:: ax.core.observation
     :members:
@@ -130,7 +138,7 @@ Objective
     :show-inheritance:
 
 `OutcomeConstraint`
-~~~~~~~~~~~~~~~~~~~~~
+~~~~~~~~~~~~~~~~~~~
 
 .. automodule:: ax.core.outcome_constraint
     :members:
@@ -139,7 +147,7 @@ Objective
     :noindex:
 
 `Parameter`
-~~~~~~~~~~~~~~~~~~~
+~~~~~~~~~~~
 
 .. automodule:: ax.core.parameter
     :members:
@@ -147,7 +155,7 @@ Objective
     :show-inheritance:
 
 `ParameterConstraint`
-~~~~~~~~~~~~~~~~~~~~~~~~~~~
+~~~~~~~~~~~~~~~~~~~~~
 
 .. automodule:: ax.core.parameter_constraint
     :members:
@@ -155,15 +163,23 @@ Objective
     :show-inheritance:
 
 `ParameterDistribution`
-~~~~~~~~~~~~~~~~~~~~~~~~~~~
+~~~~~~~~~~~~~~~~~~~~~~~
 
 .. automodule:: ax.core.parameter_distribution
     :members:
     :undoc-members:
     :show-inheritance:
 
+`RiskMeasure`
+~~~~~~~~~~~~~
+
+.. automodule:: ax.core.risk_measures
+    :members:
+    :undoc-members:
+    :show-inheritance:
+
 `Runner`
-~~~~~~~~~~~~~~~~
+~~~~~~~~
 
 .. automodule:: ax.core.runner
     :members:
@@ -171,7 +187,7 @@ Objective
     :show-inheritance:
 
 `SearchSpace`
-~~~~~~~~~~~~~~~~~~~~
+~~~~~~~~~~~~~
 
 .. automodule:: ax.core.search_space
     :members:
@@ -180,7 +196,7 @@ Objective
     :noindex:
 
 `Trial`
-~~~~~~~~
+~~~~~~~
 
 .. automodule:: ax.core.trial
     :members:
@@ -201,6 +217,14 @@ Core Utils
 ----------
 
 .. automodule:: ax.core.utils
+    :members:
+    :undoc-members:
+    :show-inheritance:
+
+Formatting Utils
+----------------
+
+.. automodule:: ax.core.formatting_utils
     :members:
     :undoc-members:
     :show-inheritance:

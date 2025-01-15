@@ -4,7 +4,10 @@
 # This source code is licensed under the MIT license found in the
 # LICENSE file in the root directory of this source tree.
 
+# pyre-strict
+
 import random
+from unittest.mock import patch
 
 import pandas as pd
 from ax.core.data import (
@@ -16,9 +19,43 @@ from ax.core.data import (
 from ax.utils.common.testutils import TestCase
 from ax.utils.common.timeutils import current_timestamp_in_millis
 
+REPR_1000: str = (
+    "Data(df=\n"
+    + "|    |   arm_name | metric_name   |   mean |   sem |   trial_index "
+    + "| start_time          | end_time            |\n"
+    + "|---:|-----------:|:--------------|-------:|------:|--------------:"
+    + "|:--------------------|:--------------------|\n"
+    + "|  0 |        0_0 | a             |    2   |   0.2 |             1 "
+    + "| 2018-01-01 00:00:00 | 2018-01-02 00:00:00 |\n"
+    + "|  1 |        0_0 | b             |    1.8 |   0.3 |             1 "
+    + "| 2018-01-01 00:00:00 | 2018-01-02 00:00:00 |\n"
+    + "|  2 |        0_1 | a             |    4   |   0.6 |             1 "
+    + "| 2018-01-01 00:00:00 | 2018-01-02 00:00:00 |\n"
+    + "|  3 |        0_1 | b             |    3.7 |   0.5 |             1 "
+    + "| 2018-01-01 00:00:00 | 2018-01-02 00:00:00 |\n"
+    + "|  4 |        0_2 | a             |    0.5 | nan   |             1 "
+    + "| 2018-01-01 00:00:00 | 2018-01-02 00:00:00 |\n"
+    + "|  5 |        0_2 | b             |    3   | nan   |             1 "
+    + "| 2018-01-01 00:00:00 | 2018-01-02 00:00:00 |)"
+)
+
+REPR_500: str = (
+    "Data(df=\n"
+    + "|    |   arm_name | metric_name   |   mean |   sem |   trial_index "
+    + "| start_time          | end_time            |\n"
+    + "|---:|-----------:|:--------------|-------:|------:|--------------:"
+    + "|:--------------------|:--------------------|\n"
+    + "|  0 |        0_0 | a             |    2   |   0.2 |             1 "
+    + "| 2018-01-01 00:00:00 | 2018-01-02 00:00:00 |\n"
+    + "|  1 |        0_0 | b             |    1.8 |   0.3 |             1 "
+    + "| 2018-01-01 00:00:00 | 2018-01-02 00:00:00 |\n"
+    + "|  2 |        0_1 | a             |    4   |   0...)"
+)
+
 
 class DataTest(TestCase):
-    def setUp(self):
+    def setUp(self) -> None:
+        super().setUp()
         self.df_hash = "3dd7ab8c67942d43c78ea4af05bbb1c4"
         self.df = pd.DataFrame(
             [
@@ -79,7 +116,7 @@ class DataTest(TestCase):
             ]
         )
 
-    def testData(self):
+    def test_Data(self) -> None:
         self.assertEqual(Data(), Data())
         data = Data(df=self.df)
         self.assertEqual(data, data)
@@ -87,24 +124,49 @@ class DataTest(TestCase):
 
         df = data.df
         self.assertEqual(
-            float(df[df["arm_name"] == "0_0"][df["metric_name"] == "a"]["mean"]), 2.0
+            float(df[df["arm_name"] == "0_0"][df["metric_name"] == "a"]["mean"].item()),
+            2.0,
         )
         self.assertEqual(
-            float(df[df["arm_name"] == "0_1"][df["metric_name"] == "b"]["sem"]), 0.5
+            float(df[df["arm_name"] == "0_1"][df["metric_name"] == "b"]["sem"].item()),
+            0.5,
         )
 
-    def testBadData(self):
+    def test_repr(self) -> None:
+        self.assertEqual(
+            str(Data(df=self.df)),
+            REPR_1000,
+        )
+        with patch(f"{Data.__module__}.DF_REPR_MAX_LENGTH", 500):
+            self.assertEqual(
+                str(Data(df=self.df)),
+                REPR_500,
+            )
+
+    def test_clone(self) -> None:
+        data = Data(df=self.df, description="test")
+        data._db_id = 1234
+        data_clone = data.clone()
+        # Check equality of the objects.
+        self.assertTrue(data.df.equals(data_clone.df))
+        self.assertEqual(data.description, data_clone.description)
+        # Make sure it's not the original object or df.
+        self.assertIsNot(data, data_clone)
+        self.assertIsNot(data.df, data_clone.df)
+        self.assertIsNone(data_clone._db_id)
+
+    def test_BadData(self) -> None:
         df = pd.DataFrame([{"bad_field": "0_0", "bad_field_2": {"x": 0, "y": "a"}}])
         with self.assertRaises(ValueError):
             Data(df=df)
 
-    def testEmptyData(self):
+    def test_EmptyData(self) -> None:
         df = Data().df
         self.assertTrue(df.empty)
         self.assertTrue(set(df.columns == Data.REQUIRED_COLUMNS))
         self.assertTrue(Data.from_multiple_data([]).df.empty)
 
-    def testSetSingleBatch(self):
+    def test_SetSingleBatch(self) -> None:
         data = Data(df=self.df)
         merged_data = set_single_trial(data)
         self.assertTrue((merged_data.df["trial_index"] == 0).all())
@@ -117,7 +179,7 @@ class DataTest(TestCase):
         merged_data = set_single_trial(data)
         self.assertTrue("trial_index" not in merged_data.df)
 
-    def testCustomData(self):
+    def test_CustomData(self) -> None:
         CustomData = custom_data_class(
             column_data_types={"metadata": str, "created_time": pd.Timestamp},
             required_columns={"metadata"},
@@ -150,23 +212,43 @@ class DataTest(TestCase):
         with self.assertRaises(ValueError):
             Data(df=pd.DataFrame([data_entry2]))
 
-    def testFromEvaluations(self):
+    def test_FromEvaluationsIsoFormat(self) -> None:
+        now = pd.Timestamp.now()
+        day = now.day
         for sem in (0.5, None):
             eval1 = (3.7, sem) if sem is not None else 3.7
             data = Data.from_evaluations(
                 evaluations={"0_1": {"b": eval1}},
                 trial_index=0,
                 sample_sizes={"0_1": 2},
-                start_time=current_timestamp_in_millis(),
-                end_time=current_timestamp_in_millis(),
+                start_time=now.isoformat(),
+                end_time=now.isoformat(),
             )
             self.assertEqual(data.df["sem"].isnull()[0], sem is None)
             self.assertEqual(len(data.df), 1)
             self.assertNotEqual(data, Data(self.df))
-            self.assertIn("start_time", data.df)
-            self.assertIn("end_time", data.df)
+            self.assertEqual(data.df["start_time"][0].day, day)
+            self.assertEqual(data.df["end_time"][0].day, day)
 
-    def testFromFidelityEvaluations(self):
+    def test_FromEvaluationsMillisecondFormat(self) -> None:
+        now_ms = current_timestamp_in_millis()
+        day = pd.Timestamp(now_ms, unit="ms").day
+        for sem in (0.5, None):
+            eval1 = (3.7, sem) if sem is not None else 3.7
+            data = Data.from_evaluations(
+                evaluations={"0_1": {"b": eval1}},
+                trial_index=0,
+                sample_sizes={"0_1": 2},
+                start_time=now_ms,
+                end_time=now_ms,
+            )
+            self.assertEqual(data.df["sem"].isnull()[0], sem is None)
+            self.assertEqual(len(data.df), 1)
+            self.assertNotEqual(data, Data(self.df))
+            self.assertEqual(data.df["start_time"][0].day, day)
+            self.assertEqual(data.df["end_time"][0].day, day)
+
+    def test_FromFidelityEvaluations(self) -> None:
         for sem in (0.5, None):
             eval1 = (3.7, sem) if sem is not None else 3.7
             eval2 = (3.8, sem) if sem is not None else 3.8
@@ -187,7 +269,7 @@ class DataTest(TestCase):
             self.assertIn("start_time", data.df)
             self.assertIn("end_time", data.df)
 
-    def testCloneWithoutMetrics(self):
+    def test_CloneWithoutMetrics(self) -> None:
         data = Data(df=self.df)
         expected = Data(
             df=pd.DataFrame(
@@ -224,7 +306,7 @@ class DataTest(TestCase):
         )
         self.assertEqual(clone_without_metrics(data, {"a"}), expected)
 
-    def testFromMultipleDataMismatchedTypes(self):
+    def test_FromMultipleDataMismatchedTypes(self) -> None:
         # create two custom data types
         CustomDataA = custom_data_class(
             column_data_types={"metadata": str, "created_time": pd.Timestamp},
@@ -268,8 +350,14 @@ class DataTest(TestCase):
             )
             Data.from_multiple_data([data_elt_A, data_elt_B])
 
-    def testGetFilteredResults(self):
+    def test_from_multiple_with_generator(self) -> None:
+        data = Data.from_multiple_data(Data(df=self.df) for _ in range(2))
+        self.assertEqual(len(data.df), 2 * len(self.df))
+
+    def test_GetFilteredResults(self) -> None:
         data = Data(df=self.df)
+        # pyre-fixme[6]: For 1st param expected `Dict[str, typing.Any]` but got `str`.
+        # pyre-fixme[6]: For 2nd param expected `Dict[str, typing.Any]` but got `str`.
         actual_filtered = data.get_filtered_results(arm_name="0_0", metric_name="a")
         # Create new Data to replicate timestamp casting.
         expected_filtered = Data(
@@ -291,17 +379,17 @@ class DataTest(TestCase):
         print(expected_filtered)
         self.assertTrue(actual_filtered.equals(expected_filtered))
 
-    def test_data_column_data_types_default(self):
+    def test_data_column_data_types_default(self) -> None:
         self.assertEqual(Data.column_data_types(), Data.COLUMN_DATA_TYPES)
 
-    def test_data_column_data_types_with_extra_columns(self):
+    def test_data_column_data_types_with_extra_columns(self) -> None:
         bartype = random.choice([str, int, float])
         columns = Data.column_data_types(extra_column_types={"foo": bartype})
         for c, t in Data.COLUMN_DATA_TYPES.items():
             self.assertEqual(columns[c], t)
         self.assertEqual(columns["foo"], bartype)
 
-    def test_data_column_data_types_with_removed_columns(self):
+    def test_data_column_data_types_with_removed_columns(self) -> None:
         columns = Data.column_data_types(excluded_columns=["fidelities"])
         self.assertNotIn("fidelities", columns)
         for c, t in Data.COLUMN_DATA_TYPES.items():
@@ -311,7 +399,7 @@ class DataTest(TestCase):
     # there isn't really a point in doing this
     # this test just documents expected behavior
     # that excluded_columns wins out
-    def test_data_column_data_types_with_extra_columns_also_deleted(self):
+    def test_data_column_data_types_with_extra_columns_also_deleted(self) -> None:
         bartype = random.choice([str, int, float])
         excluded_columns = ["fidelities", "foo"]
         columns = Data.column_data_types(

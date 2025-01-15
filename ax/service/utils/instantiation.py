@@ -4,66 +4,73 @@
 # This source code is licensed under the MIT license found in the
 # LICENSE file in the root directory of this source tree.
 
-import enum
-from dataclasses import dataclass
-from typing import Tuple, Dict, List, Optional, Union, cast
+# pyre-strict
 
-import numpy as np
+import enum
+from collections.abc import Sequence
+from copy import deepcopy
+from dataclasses import dataclass
+
+from logging import Logger
+from typing import Any, Union
+
 from ax.core.arm import Arm
-from ax.core.data import Data
-from ax.core.experiment import DataType, Experiment, DEFAULT_OBJECTIVE_NAME
-from ax.core.map_data import MapData
-from ax.core.map_metric import MapMetric
+from ax.core.auxiliary import AuxiliaryExperiment, AuxiliaryExperimentPurpose
+from ax.core.experiment import DataType, Experiment
 from ax.core.metric import Metric
-from ax.core.objective import Objective, MultiObjective
+from ax.core.multi_type_experiment import MultiTypeExperiment
+from ax.core.objective import MultiObjective, Objective
+from ax.core.observation import ObservationFeatures
 from ax.core.optimization_config import (
+    MultiObjectiveOptimizationConfig,
     ObjectiveThreshold,
     OptimizationConfig,
-    MultiObjectiveOptimizationConfig,
 )
 from ax.core.outcome_constraint import OutcomeConstraint
 from ax.core.parameter import (
-    PARAMETER_PYTHON_TYPE_MAP,
     ChoiceParameter,
     FixedParameter,
     Parameter,
+    PARAMETER_PYTHON_TYPE_MAP,
     ParameterType,
     RangeParameter,
     TParameterType,
 )
-from ax.core.parameter_constraint import OrderConstraint, ParameterConstraint
-from ax.core.search_space import SearchSpace, HierarchicalSearchSpace
-from ax.core.types import (
-    ComparisonOp,
-    TEvaluationOutcome,
-    TMapTrialEvaluation,
-    TParameterization,
-    TParamValue,
-    TTrialEvaluation,
+from ax.core.parameter_constraint import (
+    OrderConstraint,
+    ParameterConstraint,
+    validate_constraint_parameters,
 )
+from ax.core.runner import Runner
+from ax.core.search_space import HierarchicalSearchSpace, SearchSpace
+from ax.core.types import ComparisonOp, TParameterization, TParamValue
 from ax.exceptions.core import UnsupportedError
 from ax.utils.common.constants import Keys
 from ax.utils.common.logger import get_logger
 from ax.utils.common.typeutils import (
     checked_cast,
-    checked_cast_to_tuple,
     checked_cast_optional,
-    not_none,
-    numpy_type_to_python_type,
+    checked_cast_to_tuple,
 )
+from pyre_extensions import none_throws
 
-logger = get_logger(__name__)
+DEFAULT_OBJECTIVE_NAME = "objective"
+
+logger: Logger = get_logger(__name__)
 
 
 """Utilities for RESTful-like instantiation of Ax classes needed in AxClient."""
 
 
-TParameterRepresentation = Dict[
-    str, Union[TParamValue, List[TParamValue], Dict[str, List[str]]]
+TParameterRepresentation = dict[
+    str, Union[TParamValue, Sequence[TParamValue], dict[str, list[str]]]
 ]
 PARAM_CLASSES = ["range", "choice", "fixed"]
 PARAM_TYPES = {"int": int, "float": float, "bool": bool, "str": str}
-COMPARISON_OPS = {"<=": ComparisonOp.LEQ, ">=": ComparisonOp.GEQ}
+COMPARISON_OPS: dict[str, ComparisonOp] = {
+    "<=": ComparisonOp.LEQ,
+    ">=": ComparisonOp.GEQ,
+}
 EXPECTED_KEYS_IN_PARAM_REPR = {
     "name",
     "type",
@@ -74,6 +81,7 @@ EXPECTED_KEYS_IN_PARAM_REPR = {
     "log_scale",
     "target_value",
     "is_fidelity",
+    "sort_values",
     "is_ordered",
     "is_task",
     "digits",
@@ -82,16 +90,45 @@ EXPECTED_KEYS_IN_PARAM_REPR = {
 
 
 class MetricObjective(enum.Enum):
-    # pyre-fixme[20]: Argument `value` expected.
     MINIMIZE = enum.auto()
-    # pyre-fixme[20]: Argument `value` expected.
     MAXIMIZE = enum.auto()
 
 
 @dataclass
 class ObjectiveProperties:
+    r"""Class that holds properties of objective functions. Can be used to define an
+    the `objectives` argument of ax_client.create_experiment, e.g.:
+
+        ax_client.create_experiment(
+            name="moo_experiment",
+            parameters=[...],
+            objectives={
+                # `threshold` arguments are optional
+                "a": ObjectiveProperties(minimize=False, threshold=ref_point[0]),
+                "b": ObjectiveProperties(minimize=False, threshold=ref_point[1]),
+            },
+        )
+
+    Args:
+        - minimize: Boolean indicating whether the objective is to be minimized
+            or maximized.
+        - threshold: Optional `float` representing the smallest objective value
+            (resp. largest if minimize=True) that is considered valuable in the context
+            of multi-objective optimization. In BoTorch and in the literature, this is
+            also known as an element of the reference point vector that defines the
+            hyper-volume of the Pareto front.
+    """
+
     minimize: bool
-    threshold: Optional[float] = None
+    threshold: float | None = None
+
+
+@dataclass(frozen=True)
+class FixedFeatures:
+    """Class for representing fixed features via the Service API."""
+
+    parameters: TParameterization
+    trial_index: int | None = None
 
 
 class InstantiationBase:
@@ -102,16 +139,48 @@ class InstantiationBase:
     """
 
     @staticmethod
-    def _make_metric(
+    def _get_deserialized_metric_kwargs(
+        metric_class: type[Metric],
         name: str,
-        lower_is_better: Optional[bool] = None,
-        metric_class_override: Optional[type] = None,
+        metric_definitions: dict[str, dict[str, Any]] | None,
+    ) -> tuple[type[Metric], dict[str, Any]]:
+        """Get metric kwargs from metric_definitions if available and deserialize
+        if so.  Deserialization is necessary because they were serialized on creation"""
+        # deepcopy is used because of subsequent modifications to the dict
+        metric_kwargs = deepcopy((metric_definitions or {}).get(name, {}))
+        metric_class = metric_kwargs.pop("metric_class", metric_class)
+        # this is necessary before deserialization because name will be required
+        metric_kwargs["name"] = metric_kwargs.get("name", name)
+        metric_kwargs = metric_class.deserialize_init_args(metric_kwargs)
+        return metric_class, metric_kwargs
+
+    @classmethod
+    def _make_metric(
+        cls,
+        name: str,
+        lower_is_better: bool | None = None,
+        metric_class: type[Metric] = Metric,
         for_opt_config: bool = False,
+        metric_definitions: dict[str, dict[str, Any]] | None = None,
     ) -> Metric:
-        metric_class = (
-            metric_class_override if metric_class_override is not None else Metric
+        if " " in name:
+            raise ValueError(
+                "Metric names cannot contain spaces when used with AxClient. Got "
+                f"{name!r}."
+            )
+
+        metric_definitions = metric_definitions or {}
+
+        metric_class, kwargs = cls._get_deserialized_metric_kwargs(
+            name=name,
+            metric_definitions=metric_definitions,
+            metric_class=metric_class,
         )
-        return metric_class(name=name, lower_is_better=lower_is_better)
+        # avoid conflict is lower_is_better is specified in kwargs
+        kwargs["lower_is_better"] = kwargs.get("lower_is_better", lower_is_better)
+        return metric_class(
+            **kwargs,
+        )
 
     @staticmethod
     def _get_parameter_type(python_type: TParameterType) -> ParameterType:
@@ -123,13 +192,13 @@ class InstantiationBase:
     @classmethod
     def _to_parameter_type(
         cls,
-        vals: List[TParamValue],
-        typ: Optional[str],
+        vals: list[TParamValue],
+        typ: str | None,
         param_name: str,
         field_name: str,
     ) -> ParameterType:
         if typ is None:
-            typ = type(not_none(vals[0]))
+            typ = type(none_throws(vals[0]))
             parameter_type = cls._get_parameter_type(typ)  # pyre-ignore[6]
             assert all(isinstance(x, typ) for x in vals), (
                 f"Values in `{field_name}` not of the same type and no "
@@ -138,7 +207,7 @@ class InstantiationBase:
             )
             logger.info(
                 f"Inferred value type of {parameter_type} for parameter {param_name}. "
-                "If that is not the expected value type, you can explicity specify "
+                "If that is not the expected value type, you can explicitly specify "
                 "'value_type' ('int', 'float', 'bool' or 'str') in parameter dict."
             )
             return parameter_type
@@ -149,7 +218,7 @@ class InstantiationBase:
         cls,
         name: str,
         representation: TParameterRepresentation,
-        parameter_type: Optional[str],
+        parameter_type: str | None,
     ) -> RangeParameter:
         assert "bounds" in representation, "Bounds are required for range parameters."
         bounds = representation["bounds"]
@@ -178,7 +247,7 @@ class InstantiationBase:
         cls,
         name: str,
         representation: TParameterRepresentation,
-        parameter_type: Optional[str],
+        parameter_type: str | None,
     ) -> ChoiceParameter:
         values = representation["values"]
         assert isinstance(values, list) and len(values) > 1, (
@@ -195,6 +264,9 @@ class InstantiationBase:
             is_fidelity=checked_cast(bool, representation.get("is_fidelity", False)),
             is_task=checked_cast(bool, representation.get("is_task", False)),
             target_value=representation.get("target_value", None),  # pyre-ignore[6]
+            sort_values=checked_cast_optional(
+                bool, representation.get("sort_values", None)
+            ),
             dependents=checked_cast_optional(
                 dict, representation.get("dependents", None)
             ),
@@ -205,7 +277,7 @@ class InstantiationBase:
         cls,
         name: str,
         representation: TParameterRepresentation,
-        parameter_type: Optional[str],
+        parameter_type: str | None,
     ) -> FixedParameter:
         assert "value" in representation, "Value is required for fixed parameters."
         value = representation["value"]
@@ -215,9 +287,12 @@ class InstantiationBase:
         )
         return FixedParameter(
             name=name,
-            parameter_type=cls._get_parameter_type(type(value))  # pyre-ignore[6]
-            if parameter_type is None
-            else cls._get_parameter_type(PARAM_TYPES[parameter_type]),  # pyre-ignore[6]
+            parameter_type=(
+                cls._get_parameter_type(type(value))  # pyre-ignore[6]
+                if parameter_type is None
+                # pyre-ignore[6]
+                else cls._get_parameter_type(PARAM_TYPES[parameter_type])
+            ),
             value=value,  # pyre-ignore[6]
             is_fidelity=checked_cast(bool, representation.get("is_fidelity", False)),
             target_value=representation.get("target_value", None),  # pyre-ignore[6]
@@ -258,6 +333,12 @@ class InstantiationBase:
                 "'bool' or 'str'."
             )
 
+        if " " in name:
+            raise ValueError(
+                "Parameter names cannot contain spaces when used with AxClient. Got "
+                f"{name!r}."
+            )
+
         if parameter_class == "range":
             return cls._make_range_param(
                 name=name,
@@ -271,10 +352,6 @@ class InstantiationBase:
             ), "Values are required for choice parameters."
             values = representation["values"]
             if isinstance(values, list) and len(values) == 1:
-                if representation.get("dependents"):
-                    raise NotImplementedError(
-                        "Support for hierarchical fixed parameters coming soon."
-                    )
                 logger.info(
                     f"Choice parameter {name} contains only one value, converting to a"
                     + " fixed parameter instead."
@@ -299,17 +376,20 @@ class InstantiationBase:
                 parameter_type=parameter_type,
             )
         else:
-            raise ValueError(  # pragma: no cover (this is unreachable)
-                f"Unrecognized parameter type {parameter_class}."
-            )
+            raise ValueError(f"Unrecognized parameter type {parameter_class}.")
 
     @staticmethod
     def constraint_from_str(
-        representation: str, parameters: Dict[str, Parameter]
+        representation: str, parameters: dict[str, Parameter]
     ) -> ParameterConstraint:
         """Parse string representation of a parameter constraint."""
         tokens = representation.split()
         parameter_names = parameters.keys()
+        try:
+            float(tokens[-1])
+            last_token_is_numeric = True
+        except ValueError:
+            last_token_is_numeric = False
         order_const = len(tokens) == 3 and tokens[1] in COMPARISON_OPS
         sum_const = (
             len(tokens) >= 5 and len(tokens) % 2 == 1 and tokens[-2] in COMPARISON_OPS
@@ -323,7 +403,8 @@ class InstantiationBase:
                 'are ">=" and "<=".'
             )
 
-        if len(tokens) == 3:  # Case "x1 >= x2" => order constraint.
+        # Case "x1 >= x2" => order constraint.
+        if len(tokens) == 3 and not last_token_is_numeric:
             left, right = tokens[0], tokens[2]
             assert (
                 left in parameter_names
@@ -331,6 +412,9 @@ class InstantiationBase:
             assert (
                 right in parameter_names
             ), f"Parameter {right} not in {parameter_names}."
+            validate_constraint_parameters(
+                parameters=[parameters[left], parameters[right]]
+            )
             return (
                 OrderConstraint(
                     lower_parameter=parameters[left], upper_parameter=parameters[right]
@@ -340,12 +424,11 @@ class InstantiationBase:
                     lower_parameter=parameters[right], upper_parameter=parameters[left]
                 )
             )
-        try:  # Case "x1 - 2*x2 + x3 >= 2" => parameter constraint.
-            bound = float(tokens[-1])
-        except ValueError:
+        if not last_token_is_numeric:
             raise ValueError(
                 f"Bound for the constraint must be a number; got {tokens[-1]}"
             )
+        bound = float(tokens[-1])
         if any(token[0] == "*" or token[-1] == "*" for token in tokens):
             raise ValueError(
                 "A linear constraint should be the form a*x + b*y - c*z <= d"
@@ -358,7 +441,9 @@ class InstantiationBase:
             1.0 if COMPARISON_OPS[tokens[-2]] is ComparisonOp.LEQ else -1.0
         )
         operator_sign = 1.0  # Determines whether the operator is + or -
+        # tokens are alternating monomials and operators
         for idx, token in enumerate(tokens[:-2]):
+            # for monomials
             if idx % 2 == 0:
                 split_token = token.split("*")
                 parameter = ""  # Initializing the parameter
@@ -378,10 +463,14 @@ class InstantiationBase:
                         multiplier = -1.0
                     else:
                         multiplier = 1.0
+
                 assert (
                     parameter in parameter_names
                 ), f"Parameter {parameter} not in {parameter_names}."
+                validate_constraint_parameters(parameters=[parameters[parameter]])
+
                 parameter_weight[parameter] = operator_sign * multiplier
+            # for operators
             else:
                 assert (
                     token == "+" or token == "-"
@@ -395,11 +484,16 @@ class InstantiationBase:
         )
 
     @classmethod
-    def outcome_constraint_from_str(cls, representation: str) -> OutcomeConstraint:
+    def outcome_constraint_from_str(
+        cls,
+        representation: str,
+        metric_definitions: dict[str, dict[str, Any]] | None = None,
+    ) -> OutcomeConstraint:
         """Parse string representation of an outcome constraint."""
         tokens = representation.split()
         assert len(tokens) == 3 and tokens[1] in COMPARISON_OPS, (
-            "Outcome constraint should be of form `metric_name >= x`, where x is a "
+            f"Outcome constraint '{representation}' should be of "
+            "form `metric_name >= x`, where x is a "
             "float bound and comparison operator is >= or <=."
         )
         op = COMPARISON_OPS[tokens[1]]
@@ -411,9 +505,16 @@ class InstantiationBase:
                 bound_repr = bound_repr[:-1]
             bound = float(bound_repr)
         except ValueError:
-            raise ValueError("Outcome constraint bound should be a float.")
+            raise ValueError(
+                f"Outcome constraint bound should be a float for '{representation}'."
+            )
         return OutcomeConstraint(
-            cls._make_metric(name=tokens[0], for_opt_config=True),
+            cls._make_metric(
+                name=tokens[0],
+                for_opt_config=True,
+                metric_definitions=metric_definitions,
+                lower_is_better=op is ComparisonOp.LEQ,
+            ),
             op=op,
             bound=bound,
             relative=rel,
@@ -423,8 +524,11 @@ class InstantiationBase:
     def objective_threshold_constraint_from_str(
         cls,
         representation: str,
+        metric_definitions: dict[str, dict[str, Any]] | None = None,
     ) -> ObjectiveThreshold:
-        oc = cls.outcome_constraint_from_str(representation)
+        oc = cls.outcome_constraint_from_str(
+            representation, metric_definitions=metric_definitions
+        )
         return ObjectiveThreshold(
             metric=oc.metric.clone(),
             bound=oc.bound,
@@ -433,7 +537,11 @@ class InstantiationBase:
         )
 
     @classmethod
-    def make_objectives(cls, objectives: Dict[str, str]) -> List[Objective]:
+    def make_objectives(
+        cls,
+        objectives: dict[str, str],
+        metric_definitions: dict[str, dict[str, Any]] | None = None,
+    ) -> list[Objective]:
         try:
             output_objectives = []
             for metric_name, min_or_max in objectives.items():
@@ -445,6 +553,7 @@ class InstantiationBase:
                         name=metric_name,
                         for_opt_config=True,
                         lower_is_better=minimize,
+                        metric_definitions=metric_definitions,
                     ),
                     minimize=minimize,
                 )
@@ -460,11 +569,14 @@ class InstantiationBase:
 
     @classmethod
     def make_outcome_constraints(
-        cls, outcome_constraints: List[str], status_quo_defined: bool
-    ) -> List[OutcomeConstraint]:
-
+        cls,
+        outcome_constraints: list[str],
+        status_quo_defined: bool,
+        metric_definitions: dict[str, dict[str, Any]] | None = None,
+    ) -> list[OutcomeConstraint]:
         typed_outcome_constraints = [
-            cls.outcome_constraint_from_str(c) for c in outcome_constraints
+            cls.outcome_constraint_from_str(c, metric_definitions=metric_definitions)
+            for c in outcome_constraints
         ]
 
         if status_quo_defined is False and any(
@@ -478,12 +590,16 @@ class InstantiationBase:
 
     @classmethod
     def make_objective_thresholds(
-        cls, objective_thresholds: List[str], status_quo_defined: bool
-    ) -> List[ObjectiveThreshold]:
-
+        cls,
+        objective_thresholds: list[str],
+        status_quo_defined: bool,
+        metric_definitions: dict[str, dict[str, Any]] | None = None,
+    ) -> list[ObjectiveThreshold]:
         typed_objective_thresholds = (
             [
-                cls.objective_threshold_constraint_from_str(c)
+                cls.objective_threshold_constraint_from_str(
+                    c, metric_definitions=metric_definitions
+                )
                 for c in objective_thresholds
             ]
             if objective_thresholds is not None
@@ -501,9 +617,9 @@ class InstantiationBase:
 
     @staticmethod
     def optimization_config_from_objectives(
-        objectives: List[Objective],
-        objective_thresholds: List[ObjectiveThreshold],
-        outcome_constraints: List[OutcomeConstraint],
+        objectives: list[Objective],
+        objective_thresholds: list[ObjectiveThreshold],
+        outcome_constraints: list[OutcomeConstraint],
     ) -> OptimizationConfig:
         """Parse objectives and constraints to define optimization config.
 
@@ -512,7 +628,7 @@ class InstantiationBase:
         otherwise.
 
         NOTE: If passing in multiple objectives, `objective_thresholds` must be a
-        non-empty list definining constraints for each objective.
+        non-empty list defining constraints for each objective.
         """
         if len(objectives) == 1:
             if objective_thresholds:
@@ -540,25 +656,34 @@ class InstantiationBase:
     @classmethod
     def make_optimization_config(
         cls,
-        objectives: Dict[str, str],
-        objective_thresholds: List[str],
-        outcome_constraints: List[str],
+        objectives: dict[str, str],
+        objective_thresholds: list[str],
+        outcome_constraints: list[str],
         status_quo_defined: bool,
+        metric_definitions: dict[str, dict[str, Any]] | None = None,
     ) -> OptimizationConfig:
-
         return cls.optimization_config_from_objectives(
-            cls.make_objectives(objectives),
-            cls.make_objective_thresholds(objective_thresholds, status_quo_defined),
-            cls.make_outcome_constraints(outcome_constraints, status_quo_defined),
+            cls.make_objectives(objectives, metric_definitions=metric_definitions),
+            cls.make_objective_thresholds(
+                objective_thresholds,
+                status_quo_defined,
+                metric_definitions=metric_definitions,
+            ),
+            cls.make_outcome_constraints(
+                outcome_constraints,
+                status_quo_defined,
+                metric_definitions=metric_definitions,
+            ),
         )
 
     @classmethod
     def make_optimization_config_from_properties(
         cls,
-        objectives: Optional[Dict[str, ObjectiveProperties]] = None,
-        outcome_constraints: Optional[List[str]] = None,
+        objectives: dict[str, ObjectiveProperties] | None = None,
+        outcome_constraints: list[str] | None = None,
+        metric_definitions: dict[str, dict[str, Any]] | None = None,
         status_quo_defined: bool = False,
-    ) -> Optional[OptimizationConfig]:
+    ) -> OptimizationConfig | None:
         """Makes optimization config based on ObjectiveProperties objects
 
         Args:
@@ -568,6 +693,8 @@ class InstantiationBase:
             outcome_constraints: List of string representation of outcome
                 constraints of form "metric_name >= bound", like "m1 <= 3."
             status_quo_defined: bool for whether the experiment has a status quo
+            metric_definitions: A mapping of metric names to extra kwargs to pass
+                to that metric
         """
         if objectives is not None:
             objective_thresholds = (
@@ -584,15 +711,19 @@ class InstantiationBase:
                 objective_thresholds=objective_thresholds,
                 outcome_constraints=outcome_constraints or [],
                 status_quo_defined=status_quo_defined,
+                metric_definitions=metric_definitions,
             )
         return None
 
     @classmethod
     def make_search_space(
         cls,
-        parameters: List[TParameterRepresentation],
-        parameter_constraints: List[str],
+        parameters: list[TParameterRepresentation],
+        parameter_constraints: list[str] | None,
     ) -> SearchSpace:
+        parameter_constraints = (
+            parameter_constraints if parameter_constraints is not None else []
+        )
         typed_parameters = [cls.parameter_from_json(p) for p in parameters]
         is_hss = any(p.is_hierarchical for p in typed_parameters)
         search_space_cls = HierarchicalSearchSpace if is_hss else SearchSpace
@@ -646,54 +777,35 @@ class InstantiationBase:
         )
 
     @classmethod
-    def _make_optimization_config_from_legacy_args(
-        cls,
-        objective_name: str,
-        minimize: bool = False,
-        support_intermediate_data: bool = False,
-        outcome_constraints: Optional[List[str]] = None,
-        status_quo_arm: Optional[Arm] = None,
-    ) -> Optional[OptimizationConfig]:
-        """This will create a single objective OptimizationConfig based on the
-        objective_name arg.  The return is optional because in subclasses
-        we may not wish to return any default optimization config
+    def _get_default_objectives(cls) -> dict[str, str] | None:
+        """Get the default objective and its optimization direction.
+
+        The return type is optional since some subclasses may not wish to
+        use any optimization config by default.
         """
-        return OptimizationConfig(
-            objective=Objective(
-                metric=cls._make_metric(
-                    name=objective_name,
-                    lower_is_better=minimize,
-                    metric_class_override=MapMetric
-                    if support_intermediate_data
-                    else Metric,
-                    for_opt_config=True,
-                ),
-                minimize=minimize,
-            ),
-            outcome_constraints=cls.make_outcome_constraints(
-                outcome_constraints or [], status_quo_arm is not None
-            ),
-        )
+        return {DEFAULT_OBJECTIVE_NAME: "maximize"}
 
     @classmethod
     def make_experiment(
         cls,
-        parameters: List[TParameterRepresentation],
-        name: Optional[str] = None,
-        description: Optional[str] = None,
-        parameter_constraints: Optional[List[str]] = None,
-        outcome_constraints: Optional[List[str]] = None,
-        status_quo: Optional[TParameterization] = None,
-        experiment_type: Optional[str] = None,
-        tracking_metric_names: Optional[List[str]] = None,
-        # Single-objective optimization arguments:
-        objective_name: Optional[str] = None,
-        minimize: bool = False,
-        # Multi-objective optimization arguments:
-        objectives: Optional[Dict[str, str]] = None,
-        objective_thresholds: Optional[List[str]] = None,
+        parameters: list[TParameterRepresentation],
+        name: str | None = None,
+        description: str | None = None,
+        owners: list[str] | None = None,
+        parameter_constraints: list[str] | None = None,
+        outcome_constraints: list[str] | None = None,
+        status_quo: TParameterization | None = None,
+        experiment_type: str | None = None,
+        tracking_metric_names: list[str] | None = None,
+        metric_definitions: dict[str, dict[str, Any]] | None = None,
+        objectives: dict[str, str] | None = None,
+        objective_thresholds: list[str] | None = None,
         support_intermediate_data: bool = False,
         immutable_search_space_and_opt_config: bool = True,
+        auxiliary_experiments_by_purpose: None
+        | (dict[AuxiliaryExperimentPurpose, list[AuxiliaryExperiment]]) = None,
+        default_trial_type: str | None = None,
+        default_runner: Runner | None = None,
         is_test: bool = False,
     ) -> Experiment:
         """Instantiation wrapper that allows for Ax `Experiment` creation
@@ -733,13 +845,10 @@ class InstantiationBase:
                 a product in which it is used), if any.
             tracking_metric_names: Names of additional tracking metrics not used for
                 optimization.
-            objective_name: Name of the metric used as objective in this experiment,
-                if experiment is single-objective optimization.
-            minimize: Whether this experiment represents a minimization problem, if
-                experiment is a single-objective optimization.
+            metric_definitions: A mapping of metric names to extra kwargs to pass
+                to that metric
             objectives: Mapping from an objective name to "minimize" or "maximize"
-                representing the direction for that objective. Used only for
-                multi-objective optimization experiments.
+                representing the direction for that objective.
             objective_thresholds: A list of objective threshold constraints for multi-
                 objective optimization, in the same string format as
                 `outcome_constraints` argument.
@@ -750,43 +859,46 @@ class InstantiationBase:
                 Defaults to True. If set to True, we won't store or load copies of the
                 search space and optimization config on each generator run, which will
                 improve storage performance.
+            auxiliary_experiments_by_purpose: Dictionary of auxiliary experiments for
+                different use cases (e.g., transfer learning).
+            default_trial_type: The default trial type if multiple
+                trial types are intended to be used in the experiment.  If specified,
+                a MultiTypeExperiment will be created. Otherwise, a single-type
+                Experiment will be created.
+            default_runner: The default runner in this experiment.
+                This only applies to MultiTypeExperiment (when default_trial_type
+                is specified).
             is_test: Whether this experiment will be a test experiment (useful for
                 marking test experiments in storage etc). Defaults to False.
+
         """
-        if objective_name is not None and (
-            objectives is not None or objective_thresholds is not None
-        ):
-            raise UnsupportedError(
-                "Ambiguous objective definition: for single-objective optimization "
-                "`objective_name` and `minimize` arguments expected. For "
-                "multi-objective optimization `objectives` and `objective_thresholds` "
-                "arguments expected."
+        if (default_trial_type is None) != (default_runner is None):
+            raise ValueError(
+                "Must specify both default_trial_type and default_runner if "
+                "using a MultiTypeExperiment."
             )
 
         status_quo_arm = None if status_quo is None else Arm(parameters=status_quo)
 
-        # TODO(jej): Needs to be decided per-metric when supporting heterogenous data.
-        if objectives is None:
-            optimization_config = cls._make_optimization_config_from_legacy_args(
-                objective_name=objective_name or DEFAULT_OBJECTIVE_NAME,
-                minimize=minimize,
-                support_intermediate_data=support_intermediate_data,
-                outcome_constraints=outcome_constraints,
-                status_quo_arm=status_quo_arm,
+        objectives = objectives or cls._get_default_objectives()
+        if objectives:
+            optimization_config = cls.make_optimization_config(
+                objectives=objectives,
+                objective_thresholds=objective_thresholds or [],
+                outcome_constraints=outcome_constraints or [],
+                status_quo_defined=status_quo_arm is not None,
+                metric_definitions=metric_definitions,
             )
         else:
-            optimization_config = cls.make_optimization_config(
-                objectives,
-                objective_thresholds or [],
-                outcome_constraints or [],
-                status_quo_arm is not None,
-            )
+            optimization_config = None
 
         tracking_metrics = (
             None
             if tracking_metric_names is None
             else [
-                cls._make_metric(name=metric_name)
+                cls._make_metric(
+                    name=metric_name, metric_definitions=metric_definitions
+                )
                 for metric_name in tracking_metric_names
             ]
         )
@@ -795,135 +907,49 @@ class InstantiationBase:
             DataType.MAP_DATA if support_intermediate_data else DataType.DATA
         )
 
-        immutable_ss_and_oc = immutable_search_space_and_opt_config
-        properties = (
-            {}
-            if not immutable_search_space_and_opt_config
-            else {Keys.IMMUTABLE_SEARCH_SPACE_AND_OPT_CONF.value: immutable_ss_and_oc}
-        )
+        properties: dict[str, Any] = {}
+
+        if immutable_search_space_and_opt_config:
+            properties[Keys.IMMUTABLE_SEARCH_SPACE_AND_OPT_CONF] = (
+                immutable_search_space_and_opt_config
+            )
+
+        if owners is not None:
+            properties["owners"] = owners
+        if default_trial_type is not None:
+            return MultiTypeExperiment(
+                name=none_throws(name),
+                search_space=cls.make_search_space(parameters, parameter_constraints),
+                default_trial_type=none_throws(default_trial_type),
+                default_runner=none_throws(default_runner),
+                optimization_config=optimization_config,
+                tracking_metrics=tracking_metrics,
+                status_quo=status_quo_arm,
+                description=description,
+                is_test=is_test,
+                experiment_type=experiment_type,
+                properties=properties,
+                default_data_type=default_data_type,
+            )
 
         return Experiment(
             name=name,
             description=description,
-            search_space=cls.make_search_space(parameters, parameter_constraints or []),
+            search_space=cls.make_search_space(parameters, parameter_constraints),
             optimization_config=optimization_config,
             status_quo=status_quo_arm,
             experiment_type=experiment_type,
             tracking_metrics=tracking_metrics,
             default_data_type=default_data_type,
             properties=properties,
+            auxiliary_experiments_by_purpose=auxiliary_experiments_by_purpose,
             is_test=is_test,
         )
 
-    @staticmethod
-    def raw_data_to_evaluation(
-        raw_data: TEvaluationOutcome,
-        metric_names: List[str],
-        start_time: Optional[int] = None,
-        end_time: Optional[int] = None,
-    ) -> TEvaluationOutcome:
-        """Format the trial evaluation data to a standard `TTrialEvaluation`
-        (mapping from metric names to a tuple of mean and SEM) representation, or
-        to a TMapTrialEvaluation.
-
-        Note: this function expects raw_data to be data for a `Trial`, not a
-        `BatchedTrial`.
-        """
-        if isinstance(raw_data, dict):
-            if any(isinstance(x, dict) for x in raw_data.values()):  # pragma: no cover
-                raise ValueError("Raw data is expected to be just for one arm.")
-            for metric_name, dat in raw_data.items():
-                if not isinstance(dat, tuple):
-                    if not isinstance(dat, (float, int)):
-                        raise ValueError(
-                            "Raw data for an arm is expected to either be a tuple of "
-                            "numerical mean and SEM or just a numerical mean."
-                            f"Got: {dat} for metric '{metric_name}'."
-                        )
-                    raw_data[metric_name] = (float(dat), None)
-            return raw_data
-        elif len(metric_names) > 1:
-            raise ValueError(
-                "Raw data must be a dictionary of metric names to mean "
-                "for multi-objective optimizations."
-            )
-        elif isinstance(raw_data, list):
-            return raw_data
-        elif isinstance(raw_data, tuple):
-            return {metric_names[0]: raw_data}
-        elif isinstance(raw_data, (float, int)):
-            return {metric_names[0]: (raw_data, None)}
-        elif isinstance(raw_data, (np.float32, np.float64, np.int32, np.int64)):
-            return {metric_names[0]: (numpy_type_to_python_type(raw_data), None)}
-        else:
-            raise ValueError(
-                "Raw data has an invalid type. The data must either be in the form "
-                "of a dictionary of metric names to mean, sem tuples, "
-                "or a single mean, sem tuple, or a single mean."
-            )
-
-    @classmethod
-    def data_and_evaluations_from_raw_data(
-        cls,
-        raw_data: Dict[str, TEvaluationOutcome],
-        metric_names: List[str],
-        trial_index: int,
-        sample_sizes: Dict[str, int],
-        start_time: Optional[int] = None,
-        end_time: Optional[int] = None,
-    ) -> Tuple[Dict[str, TEvaluationOutcome], Data]:
-        """Transforms evaluations into Ax Data.
-
-        Each evaluation is either a trial evaluation: {metric_name -> (mean, SEM)}
-        or a fidelity trial evaluation for multi-fidelity optimizations:
-        [(fidelities, {metric_name -> (mean, SEM)})].
-
-        Args:
-            raw_data: Mapping from arm name to raw_data.
-            metric_names: Names of metrics used to transform raw data to evaluations.
-            trial_index: Index of the trial, for which the evaluations are.
-            sample_sizes: Number of samples collected for each arm, may be empty
-                if unavailable.
-            start_time: Optional start time of run of the trial that produced this
-                data, in milliseconds.
-            end_time: Optional end time of run of the trial that produced this
-                data, in milliseconds.
-        """
-        evaluations = {
-            arm_name: cls.raw_data_to_evaluation(
-                raw_data=raw_data[arm_name],
-                metric_names=metric_names,
-                start_time=start_time,
-                end_time=end_time,
-            )
-            for arm_name in raw_data
-        }
-        if all(isinstance(evaluations[x], dict) for x in evaluations.keys()):
-            # All evaluations are no-fidelity evaluations.
-            data = Data.from_evaluations(
-                evaluations=cast(Dict[str, TTrialEvaluation], evaluations),
-                trial_index=trial_index,
-                sample_sizes=sample_sizes,
-                start_time=start_time,
-                end_time=end_time,
-            )
-        elif all(isinstance(evaluations[x], list) for x in evaluations.keys()):
-            # All evaluations are map evaluations.
-            data = MapData.from_map_evaluations(
-                evaluations=cast(Dict[str, TMapTrialEvaluation], evaluations),
-                trial_index=trial_index,
-            )
-        else:
-            raise ValueError(  # pragma: no cover
-                "Evaluations included a mixture of no-fidelity and with-fidelity "
-                "evaluations, which is not currently supported."
-            )
-        return evaluations, data
-
     @classmethod
     def build_objective_thresholds(
-        cls, objectives: Dict[str, ObjectiveProperties]
-    ) -> List[str]:
+        cls, objectives: dict[str, ObjectiveProperties]
+    ) -> list[str]:
         """Construct a list of constraint string for an objective thresholds
         interpretable by `make_experiment()`
 
@@ -954,3 +980,24 @@ class InstantiationBase:
         """
         operator = "<=" if objective_properties.minimize else ">="
         return f"{objective} {operator} {objective_properties.threshold}"
+
+    @staticmethod
+    def make_fixed_observation_features(
+        fixed_features: FixedFeatures,
+    ) -> ObservationFeatures:
+        """Construct ObservationFeatures from FixedFeatures.
+
+        Args:
+            fixed_features: The fixed features for generation.
+
+        Returns:
+            The new ObservationFeatures object.
+        """
+        return ObservationFeatures(
+            parameters=fixed_features.parameters,
+            trial_index=(
+                None
+                if fixed_features.trial_index is None
+                else fixed_features.trial_index
+            ),
+        )

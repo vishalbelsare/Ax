@@ -4,20 +4,23 @@
 # This source code is licensed under the MIT license found in the
 # LICENSE file in the root directory of this source tree.
 
+# pyre-strict
+
 from __future__ import annotations
 
 from copy import deepcopy
 from enum import Enum
 from functools import lru_cache
 from math import sqrt
-from typing import Any, Dict, Tuple
+from typing import Any
 
-import numpy as np
+import numpy.typing as npt
 import pandas as pd
 from ax.core.arm import Arm
 from ax.core.base_trial import BaseTrial
 from ax.core.data import Data
-from ax.core.metric import Metric
+from ax.core.metric import Metric, MetricFetchE, MetricFetchResult
+from ax.utils.common.result import Err, Ok
 from ax.utils.common.typeutils import checked_cast
 from sklearn import datasets
 from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
@@ -26,18 +29,24 @@ from sklearn.neural_network import MLPClassifier, MLPRegressor
 
 
 class SklearnModelType(Enum):
+    # pyre-fixme[35]: Target cannot be annotated.
     RF: str = "rf"
+    # pyre-fixme[35]: Target cannot be annotated.
     NN: str = "nn"
 
 
 class SklearnDataset(Enum):
+    # pyre-fixme[35]: Target cannot be annotated.
     DIGITS: str = "digits"
+    # pyre-fixme[35]: Target cannot be annotated.
     BOSTON: str = "boston"
+    # pyre-fixme[35]: Target cannot be annotated.
     CANCER: str = "cancer"
 
 
 @lru_cache(maxsize=8)
-def _get_data(dataset) -> Dict[str, np.ndarray]:
+# pyre-fixme[2]: Parameter must be annotated.
+def _get_data(dataset) -> dict[str, npt.NDArray]:
     """Return sklearn dataset, loading and caching if necessary."""
     if dataset is SklearnDataset.DIGITS:
         return datasets.load_digits()
@@ -101,6 +110,7 @@ class SklearnMetric(Metric):
             )
         if model_type is SklearnModelType.NN:
             if regression:
+                # pyre-fixme[4]: Attribute must be annotated.
                 self._model_cls = MLPRegressor
             else:
                 self._model_cls = MLPClassifier
@@ -124,29 +134,35 @@ class SklearnMetric(Metric):
 
     def fetch_trial_data(
         self, trial: BaseTrial, noisy: bool = True, **kwargs: Any
-    ) -> Data:
-        arm_names = []
-        means = []
-        sems = []
-        for name, arm in trial.arms_by_name.items():
-            arm_names.append(name)
-            # TODO: Consider parallelizing evaluation of large batches
-            # (e.g. via ProcessPoolExecutor)
-            mean, sem = self.train_eval(arm=arm)
-            means.append(mean)
-            sems.append(sem)
-        df = pd.DataFrame(
-            {
-                "arm_name": arm_names,
-                "metric_name": self._name,
-                "mean": means,
-                "sem": sems,
-                "trial_index": trial.index,
-            }
-        )
-        return Data(df=df)
+    ) -> MetricFetchResult:
+        try:
+            arm_names = []
+            means = []
+            sems = []
+            for name, arm in trial.arms_by_name.items():
+                arm_names.append(name)
+                # TODO: Consider parallelizing evaluation of large batches
+                # (e.g. via ProcessPoolExecutor)
+                mean, sem = self.train_eval(arm=arm)
+                means.append(mean)
+                sems.append(sem)
+            df = pd.DataFrame(
+                {
+                    "arm_name": arm_names,
+                    "metric_name": self._name,
+                    "mean": means,
+                    "sem": sems,
+                    "trial_index": trial.index,
+                }
+            )
+            return Ok(value=Data(df=df))
 
-    def train_eval(self, arm: Arm) -> Tuple[float, float]:
+        except Exception as e:
+            return Err(
+                MetricFetchE(message=f"Failed to fetch {self.name}", exception=e)
+            )
+
+    def train_eval(self, arm: Arm) -> tuple[float, float]:
         """Train and evaluate model.
 
         Args:
@@ -160,7 +176,7 @@ class SklearnMetric(Metric):
         """
         data = _get_data(self.dataset)  # cached
         X, y = data["data"], data["target"]
-        params: Dict[str, Any] = deepcopy(arm.parameters)
+        params: dict[str, Any] = deepcopy(arm.parameters)
         if self.model_type == SklearnModelType.NN:
             hidden_layer_size = params.pop("hidden_layer_size", None)
             if hidden_layer_size is not None:

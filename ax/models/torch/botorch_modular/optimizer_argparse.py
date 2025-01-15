@@ -4,124 +4,108 @@
 # This source code is licensed under the MIT license found in the
 # LICENSE file in the root directory of this source tree.
 
+# pyre-strict
+
 from __future__ import annotations
 
-from typing import Any, Dict, Optional, Type, TypeVar, Union
+from typing import Any
 
-import torch
-from ax.utils.common.constants import Keys
+from ax.exceptions.core import UnsupportedError
 from botorch.acquisition.acquisition import AcquisitionFunction
 from botorch.acquisition.knowledge_gradient import qKnowledgeGradient
-from botorch.acquisition.max_value_entropy_search import qMaxValueEntropy
-from botorch.acquisition.multi_objective.monte_carlo import (
-    qExpectedHypervolumeImprovement,
-)
-from botorch.optim.initializers import gen_one_shot_kg_initial_conditions
-from botorch.utils.dispatcher import Dispatcher
 
-T = TypeVar("T")
-MaybeType = Union[T, Type[T]]  # Annotation for a type or instance thereof
+# Acquisition defaults
+NUM_RESTARTS = 20
+RAW_SAMPLES = 1024
+INIT_BATCH_LIMIT = 32
+BATCH_LIMIT = 5
 
 
-def _optimizerArgparse_encoder(arg: Any) -> Type:
-    """
-    Transforms arguments passed to `optimizer_argparse.__call__`
-    at runtime to construct the key used for method lookup as
-    `tuple(map(arg_transform, args))`.
-
-    This custom arg_transform allow type variables to be passed
-    at runtime.
-    """
-    # Allow type variables to be passed as arguments at runtime
-    return arg if isinstance(arg, type) else type(arg)
-
-
-optimizer_argparse = Dispatcher(
-    name="optimizer_argparse", encoder=_optimizerArgparse_encoder
-)
-
-
-@optimizer_argparse.register(AcquisitionFunction)
-def _argparse_base(
-    acqf: MaybeType[AcquisitionFunction],
-    num_restarts: int = 40,
-    raw_samples: int = 1024,
-    optimizer_options: Optional[Dict[str, Any]] = None,
-    **ignore: Any,
-) -> Dict[str, Any]:
-    return {
-        "num_restarts": num_restarts,
-        "raw_samples": raw_samples,
-        **(optimizer_options or {}),
-    }
-
-
-@optimizer_argparse.register(qExpectedHypervolumeImprovement)
-def _argparse_ehvi(
-    acqf: MaybeType[qExpectedHypervolumeImprovement],
-    sequential: bool = True,
-    init_batch_limit: int = 128,
-    batch_limit: int = 5,
-    optimizer_options: Optional[Dict[str, Any]] = None,
-    **kwargs: Any,
-) -> Dict[str, Any]:
-    return {
-        **_argparse_base(acqf, **kwargs),
-        "sequential": sequential,
-        "options": {"init_batch_limit": init_batch_limit, "batch_limit": batch_limit},
-        **(optimizer_options or {}),
-    }
-
-
-@optimizer_argparse.register(qKnowledgeGradient)
-def _argparse_kg(
-    acqf: qKnowledgeGradient,
-    q: int,
-    bounds: torch.Tensor,
-    num_restarts: int = 40,
-    raw_samples: int = 1024,
-    frac_random: float = 0.1,
-    optimizer_options: Optional[Dict[str, Any]] = None,
-    **kwargs: Any,
-) -> Dict[str, Any]:
-
-    optimizer_options = optimizer_options or {}
-    base_options = _argparse_base(
-        acqf,
-        num_restarts=num_restarts,
-        raw_samples=raw_samples,
-        **kwargs,
-    )
-
-    initial_conditions = gen_one_shot_kg_initial_conditions(
-        acq_function=acqf,
-        bounds=bounds,
-        q=q,
-        num_restarts=num_restarts,
-        raw_samples=raw_samples,
-        options={
-            Keys.FRAC_RANDOM: frac_random,
-            Keys.NUM_INNER_RESTARTS: num_restarts,
-            Keys.RAW_INNER_SAMPLES: raw_samples,
-        },
-    )
-
-    return {
-        **base_options,
-        Keys.BATCH_INIT_CONDITIONS: initial_conditions,
-        **(optimizer_options or {}),
-    }
-
-
-@optimizer_argparse.register(qMaxValueEntropy)
-def _argparse_mes(
+def optimizer_argparse(
     acqf: AcquisitionFunction,
-    sequential: bool = True,
-    optimizer_options: Optional[Dict[str, Any]] = None,
-    **kwargs: Any,
-) -> Dict[str, Any]:
-    return {
-        **_argparse_base(acqf, **kwargs),
-        "sequential": sequential,
-        **(optimizer_options or {}),
-    }
+    *,
+    optimizer: str,
+    optimizer_options: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Extract the kwargs to be passed to a BoTorch optimizer.
+
+    Args:
+        acqf: The acquisition function being optimized.
+        optimizer: The optimizer to parse args for. Typically chosen by
+            `Acquisition.optimize`. Must be one of:
+            - "optimize_acqf",
+            - "optimize_acqf_discrete_local_search",
+            - "optimize_acqf_discrete",
+            - "optimize_acqf_homotopy",
+            - "optimize_acqf_mixed",
+            - "optimize_acqf_mixed_alternating".
+        optimizer_options: An optional dictionary of optimizer options (some of
+            these under an `options` dictionary); default values will be used
+            where not specified. See the docstrings in
+            `botorch/optim/optimize.py` for supported options.
+            Example:
+                >>> optimizer_options = {
+                >>>     "num_restarts": 20,
+                >>>     "options": {
+                >>>         "maxiter": 200,
+                >>>         "batch_limit": 5,
+                >>>     },
+                >>>     "retry_on_optimization_warning": False,
+                >>> }
+    """
+    supported_optimizers = [
+        "optimize_acqf",
+        "optimize_acqf_discrete_local_search",
+        "optimize_acqf_discrete",
+        "optimize_acqf_homotopy",
+        "optimize_acqf_mixed",
+        "optimize_acqf_mixed_alternating",
+    ]
+    if optimizer not in supported_optimizers:
+        raise ValueError(
+            f"optimizer=`{optimizer}` is not supported. Accepted options are "
+            f"{supported_optimizers}"
+        )
+    if (optimizer != "optimize_acqf") and isinstance(acqf, qKnowledgeGradient):
+        raise RuntimeError(
+            "Ax is attempting to use a discrete or mixed optimizer, "
+            f"`{optimizer}`, but this is not compatible with "
+            "`qKnowledgeGradient` or its subclasses. To address this, please "
+            "either use a different acquisition class or make parameters "
+            "continuous using the transform "
+            "`ax.modelbridge.registry.Cont_X_trans`."
+        )
+    provided_options = optimizer_options if optimizer_options is not None else {}
+
+    # Construct arguments from options that are not `provided_options`.
+    if optimizer == "optimize_acqf_discrete":
+        # `optimize_acqf_discrete` only accepts 'choices', 'max_batch_size', 'unique'.
+        options = {}
+    else:
+        options = {
+            "num_restarts": NUM_RESTARTS,
+            "raw_samples": RAW_SAMPLES,
+        }
+
+    if optimizer in [
+        "optimize_acqf",
+        "optimize_acqf_homotopy",
+        "optimize_acqf_mixed",
+        "optimize_acqf_mixed_alternating",
+    ]:
+        options["options"] = {
+            "init_batch_limit": INIT_BATCH_LIMIT,
+            "batch_limit": BATCH_LIMIT,
+            **provided_options.get("options", {}),
+        }
+    # Error out if options are specified for an optimizer that does not support the arg.
+    elif "options" in provided_options:
+        raise UnsupportedError(
+            f"`{optimizer=}` does not support the `options` argument."
+        )
+
+    if optimizer == "optimize_acqf":
+        options["sequential"] = True
+
+    options.update(**{k: v for k, v in provided_options.items() if k != "options"})
+    return options

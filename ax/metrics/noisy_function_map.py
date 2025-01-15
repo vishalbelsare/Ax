@@ -4,18 +4,27 @@
 # This source code is licensed under the MIT license found in the
 # LICENSE file in the root directory of this source tree.
 
+# pyre-strict
+
 from __future__ import annotations
 
-from typing import Any, Iterable, Mapping, Optional
+from collections.abc import Iterable, Mapping
+
+from logging import Logger
+
+from typing import Any
 
 import numpy as np
+import numpy.typing as npt
 import pandas as pd
 from ax.core.base_trial import BaseTrial
 from ax.core.map_data import MapData, MapKeyInfo
-from ax.core.map_metric import MapMetric
+from ax.core.map_metric import MapMetric, MapMetricFetchResult
+from ax.core.metric import MetricFetchE
 from ax.utils.common.logger import get_logger
+from ax.utils.common.result import Err, Ok
 
-logger = get_logger(__name__)
+logger: Logger = get_logger(__name__)
 
 
 class NoisyFunctionMapMetric(MapMetric):
@@ -23,13 +32,14 @@ class NoisyFunctionMapMetric(MapMetric):
     with mean 0 and mean_sd scale added to the result.
     """
 
+    map_key_info: MapKeyInfo[float] = MapKeyInfo(key="timestamp", default_value=0.0)
+
     def __init__(
         self,
         name: str,
         param_names: Iterable[str],
-        map_key_infos: Iterable[MapKeyInfo],
         noise_sd: float = 0.0,
-        lower_is_better: Optional[bool] = None,
+        lower_is_better: bool | None = None,
         cache_evaluations: bool = True,
     ) -> None:
         """
@@ -52,8 +62,8 @@ class NoisyFunctionMapMetric(MapMetric):
                 observation noise.
         """
         self.param_names = param_names
-        self.map_key_infos = map_key_infos
         self.noise_sd = noise_sd
+        # pyre-fixme[4]: Attribute must be annotated.
         self.cache = {}
         self.cache_evaluations = cache_evaluations
         super().__init__(name=name, lower_is_better=lower_is_better)
@@ -70,7 +80,6 @@ class NoisyFunctionMapMetric(MapMetric):
         return self.__class__(
             name=self._name,
             param_names=self.param_names,
-            map_key_infos=self.map_key_infos,
             noise_sd=self.noise_sd,
             lower_is_better=self.lower_is_better,
             cache_evaluations=self.cache_evaluations,
@@ -78,28 +87,32 @@ class NoisyFunctionMapMetric(MapMetric):
 
     def fetch_trial_data(
         self, trial: BaseTrial, noisy: bool = True, **kwargs: Any
-    ) -> MapData:
-        res = [
-            self.f(np.fromiter(arm.parameters.values(), dtype=float))
-            for arm in trial.arms
-        ]
+    ) -> MapMetricFetchResult:
+        try:
+            res = [
+                self.f(np.fromiter(arm.parameters.values(), dtype=float))
+                for arm in trial.arms
+            ]
 
-        df = pd.DataFrame(
-            {
-                "arm_name": [arm.name for arm in trial.arms],
-                "metric_name": self.name,
-                "sem": self.noise_sd if noisy else 0.0,
-                "trial_index": trial.index,
-                "mean": [item["mean"] for item in res],
-                **{
-                    mki.key: [item[mki.key] for item in res]
-                    for mki in self.map_key_infos
-                },
-            }
-        )
+            df = pd.DataFrame(
+                {
+                    "arm_name": [arm.name for arm in trial.arms],
+                    "metric_name": self.name,
+                    "sem": self.noise_sd if noisy else 0.0,
+                    "trial_index": trial.index,
+                    "mean": [item["mean"] for item in res],
+                    self.map_key_info.key: [
+                        item[self.map_key_info.key] for item in res
+                    ],
+                }
+            )
+            return Ok(value=MapData(df=df, map_key_infos=[self.map_key_info]))
 
-        return MapData(df=df, map_key_infos=self.map_key_infos)
+        except Exception as e:
+            return Err(
+                MetricFetchE(message=f"Failed to fetch {self.name}", exception=e)
+            )
 
-    def f(self, x: np.ndarray) -> Mapping[str, Any]:
+    def f(self, x: npt.NDArray) -> Mapping[str, Any]:
         """The deterministic function that produces the metric outcomes."""
         raise NotImplementedError

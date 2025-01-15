@@ -4,7 +4,10 @@
 # This source code is licensed under the MIT license found in the
 # LICENSE file in the root directory of this source tree.
 
-from typing import Any, Iterable
+# pyre-strict
+
+from collections.abc import Iterable
+from typing import Any
 
 
 class DataProviderError(Exception):
@@ -16,7 +19,11 @@ class DataProviderError(Exception):
     """
 
     def __init__(
-        self, message: str, data_provider: str, data_provider_error: Any
+        self,
+        message: str,
+        data_provider: str,
+        # pyre-fixme[2]: Parameter annotation cannot be `Any`.
+        data_provider_error: Any,
     ) -> None:
         self.message = message
         self.data_provider = data_provider

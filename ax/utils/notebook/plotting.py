@@ -4,25 +4,35 @@
 # This source code is licensed under the MIT license found in the
 # LICENSE file in the root directory of this source tree.
 
+# pyre-strict
+
+from logging import Logger
+
 from ax.plot.base import AxPlotConfig, AxPlotTypes
 from ax.plot.render import _js_requires, _wrap_js, plot_config_to_html
 from ax.utils.common.logger import get_logger
 from IPython.display import display
 from plotly.offline import init_notebook_mode, iplot
 
+logger: Logger = get_logger(__name__)
 
-logger = get_logger(__name__)
 
-
-def init_notebook_plotting(offline=False):
+def init_notebook_plotting(offline: bool = False) -> None:
     """Initialize plotting in notebooks, either in online or offline mode."""
     display_bundle = {"text/html": _wrap_js(_js_requires(offline=offline))}
     display(display_bundle, raw=True)
     logger.info("Injecting Plotly library into cell. Do not overwrite or delete cell.")
+    logger.info(
+        """
+    Please see
+    (https://ax.dev/tutorials/visualizations.html#Fix-for-plots-that-are-not-rendering)
+    if visualizations are not rendering.
+    """.strip()
+    )
     init_notebook_mode()
 
 
-def render(plot_config: AxPlotConfig, inject_helpers=False) -> None:
+def render(plot_config: AxPlotConfig, inject_helpers: bool = False) -> None:
     """Render plot config."""
     if plot_config.plot_type == AxPlotTypes.GENERIC:
         iplot(plot_config.data)

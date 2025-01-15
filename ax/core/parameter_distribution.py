@@ -3,22 +3,26 @@
 # This source code is licensed under the MIT license found in the
 # LICENSE file in the root directory of this source tree.
 
+# pyre-strict
+
 from __future__ import annotations
 
-import functools
 from copy import deepcopy
 from importlib import import_module
-from typing import Any, Dict, List, Optional
+from typing import Any, TYPE_CHECKING
 
 from ax.exceptions.core import UserInputError
-from ax.utils.common.base import Base
-from scipy.stats._distn_infrastructure import rv_generic
+from ax.utils.common.base import SortableBase
+
+if TYPE_CHECKING:
+    from ax.core.search_space import RobustSearchSpace
+    from scipy.stats.distributions import rv_frozen  # pyre-ignore [21]
 
 TDistribution = str
 TParamName = str
 
 
-class ParameterDistribution(Base):
+class ParameterDistribution(SortableBase):
     """A class for defining parameter distributions.
 
     Intended for robust optimization use cases. This could be used to specify the
@@ -27,9 +31,9 @@ class ParameterDistribution(Base):
 
     def __init__(
         self,
-        parameters: List[TParamName],
+        parameters: list[TParamName],
         distribution_class: TDistribution,
-        distribution_parameters: Optional[Dict[str, Any]],
+        distribution_parameters: dict[str, Any] | None,
         multiplicative: bool = False,
     ) -> None:
         """Initialize a parameter distribution.
@@ -49,14 +53,37 @@ class ParameterDistribution(Base):
         """
         super().__init__()
         self.parameters = parameters
-        self.distribution_class = distribution_class
-        self.distribution_parameters = distribution_parameters or {}
+        self._distribution_class = distribution_class
+        self._distribution_parameters: dict[str, Any] = distribution_parameters or {}
         self.multiplicative = multiplicative
+        self._distribution: rv_frozen | None = None  # pyre-ignore [11]
 
     @property
-    @functools.lru_cache()
-    def distribution(self) -> rv_generic:
-        """Get the distribution object."""
+    def distribution_class(self) -> TDistribution:
+        r"""The name of the scipy distribution class."""
+        return self._distribution_class
+
+    @distribution_class.setter
+    def distribution_class(self, new_class: TDistribution) -> None:
+        r"""Update the distribution class and delete the cached distribution object."""
+        self._distribution = None
+        self._distribution_class = new_class
+
+    @property
+    def distribution_parameters(self) -> dict[str, Any]:
+        r"""The parameters of the distribution."""
+        return self._distribution_parameters
+
+    @distribution_parameters.setter
+    def distribution_parameters(self, new_parameters: dict[str, Any]) -> None:
+        r"""Update the distribution parameters and delete the cached
+        distribution object.
+        """
+        self._distribution = None
+        self._distribution_parameters = new_parameters
+
+    def _construct_distribution_object(self) -> None:
+        r"""Constructs the scipy distribution object."""
         stats = import_module("scipy.stats")
         try:
             dist_class = getattr(stats, self.distribution_class)
@@ -66,7 +93,26 @@ class ParameterDistribution(Base):
                 f"{self.distribution_class}. Make sure that the "
                 "`distribution_class` is importable from `scipy.stats`."
             )
-        return dist_class(**self.distribution_parameters)
+        self._distribution = dist_class(**self.distribution_parameters)
+
+    @property
+    def distribution(self) -> rv_frozen:
+        """Get the distribution object."""
+        if self._distribution is None:
+            self._construct_distribution_object()
+        return self._distribution
+
+    def is_environmental(self, search_space: RobustSearchSpace) -> bool:
+        r"""Check if the parameters are environmental variables of the given
+        search space.
+
+        Args:
+            search_space: The search space to check.
+
+        Returns:
+            A boolean denoting whether the parameters are environmental variables.
+        """
+        return any(search_space.is_environmental_variable(p) for p in self.parameters)
 
     def clone(self) -> ParameterDistribution:
         """Clone."""
@@ -94,3 +140,7 @@ class ParameterDistribution(Base):
             "distribution_parameters=" + repr(self.distribution_parameters) + ", "
             "multiplicative=" + repr(self.multiplicative) + ")"
         )
+
+    @property
+    def _unique_id(self) -> str:
+        return str(self)

@@ -4,22 +4,25 @@
 # This source code is licensed under the MIT license found in the
 # LICENSE file in the root directory of this source tree.
 
+# pyre-strict
+
 import numpy as np
 import torch
 from ax.models.torch.cbo_lcem import LCEMBO
 from ax.utils.common.testutils import TestCase
-from ax.utils.testing.mock import fast_botorch_optimize
-from botorch.models.contextual_multioutput import FixedNoiseLCEMGP, LCEMGP
+from ax.utils.testing.mock import mock_botorch_optimize
+from botorch.models.contextual_multioutput import LCEMGP
 from botorch.models.model_list_gp_regression import ModelListGP
 
 
 class LCEMBOTest(TestCase):
-    @fast_botorch_optimize
-    def testLCEMBO(self):
+    @mock_botorch_optimize
+    def test_LCEMBO(self) -> None:
         d = 1
         train_x = torch.rand(10, d)
         train_y = torch.cos(train_x)
         task_indices = torch.tensor([0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0, 1.0])
+        # pyre-fixme[28]: Unexpected keyword argument `axis`.
         train_x = torch.cat([train_x, task_indices.unsqueeze(-1)], axis=1)
 
         # Test setting attributes
@@ -51,7 +54,7 @@ class LCEMBOTest(TestCase):
             metric_names=[],
         )
         self.assertIsInstance(gp, ModelListGP)
-        self.assertIsInstance(gp.models[0], FixedNoiseLCEMGP)
+        self.assertIsInstance(gp.models[0], LCEMGP)
 
         # Verify errors are raised in get_and_fit_model
         train_yvar = np.nan * torch.ones(train_y.shape)

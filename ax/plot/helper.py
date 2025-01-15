@@ -4,34 +4,42 @@
 # This source code is licensed under the MIT license found in the
 # LICENSE file in the root directory of this source tree.
 
+# pyre-strict
+
 import math
 from collections import Counter
-from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Union
+from collections.abc import Callable
+
+from logging import Logger
+from typing import Any, Optional, Union
 
 import numpy as np
+import numpy.typing as npt
 from ax.core.generator_run import GeneratorRun
 from ax.core.observation import Observation, ObservationFeatures
-from ax.core.parameter import ChoiceParameter, FixedParameter, RangeParameter
+from ax.core.parameter import ChoiceParameter, FixedParameter, Parameter, RangeParameter
 from ax.core.types import TParameterization
 from ax.modelbridge.base import ModelBridge
-from ax.modelbridge.prediction_utils import predict_at_point
+from ax.modelbridge.prediction_utils import (
+    _compute_scalarized_outcome,
+    predict_at_point,
+)
 from ax.modelbridge.transforms.ivw import IVW
 from ax.plot.base import DECIMALS, PlotData, PlotInSampleArm, PlotOutOfSampleArm, Z
 from ax.utils.common.logger import get_logger
-from ax.utils.common.typeutils import not_none
+from pyre_extensions import none_throws
 
-
-logger = get_logger(__name__)
+logger: Logger = get_logger(__name__)
 
 # Typing alias
-RawData = List[Dict[str, Union[str, float]]]
+RawData = list[dict[str, Union[str, float]]]
 
-TNullableGeneratorRunsDict = Optional[Dict[str, GeneratorRun]]
+TNullableGeneratorRunsDict = Optional[dict[str, GeneratorRun]]
 
 
 def extend_range(
     lower: float, upper: float, percent: int = 10, log_scale: bool = False
-) -> Tuple[float, float]:
+) -> tuple[float, float]:
     """Given a range of minimum and maximum values taken by values on a given axis,
     extend it in both directions by a given percentage to have some margin within
     the plot around its meaningful part.
@@ -64,7 +72,7 @@ def _format_dict(param_dict: TParameterization, name: str = "Parameterization") 
         )
     else:
         blob = "<br><em>{}:</em><br>{}".format(
-            name, "<br>".join("{}: {}".format(n, v) for n, v in param_dict.items())
+            name, "<br>".join(f"{n}: {v}" for n, v in param_dict.items())
         )
     return blob
 
@@ -102,7 +110,7 @@ def _format_CI(estimate: float, sd: float, relative: bool, zval: float = Z) -> s
     )
 
 
-def arm_name_to_tuple(arm_name: str) -> Union[Tuple[int, int], Tuple[int]]:
+def arm_name_to_tuple(arm_name: str) -> tuple[int, int] | tuple[int]:
     tup = arm_name.split("_")
     if len(tup) == 2:
         try:
@@ -112,7 +120,7 @@ def arm_name_to_tuple(arm_name: str) -> Union[Tuple[int, int], Tuple[int]]:
     return (0,)
 
 
-def arm_name_to_sort_key(arm_name: str) -> Tuple[str, int, int]:
+def arm_name_to_sort_key(arm_name: str) -> tuple[str, int, int]:
     """Parses arm name into tuple suitable for reverse sorting by key
 
     Example:
@@ -127,14 +135,14 @@ def arm_name_to_sort_key(arm_name: str) -> Tuple[str, int, int]:
         return (arm_name, 0, 0)
 
 
-def resize_subtitles(figure: Dict[str, Any], size: int):
+def resize_subtitles(figure: dict[str, Any], size: int) -> dict[str, Any]:
     for ant in figure["layout"]["annotations"]:
         ant["font"].update(size=size)
     return figure
 
 
 def _filter_dict(
-    param_dict: TParameterization, subset_keys: List[str]
+    param_dict: TParameterization, subset_keys: list[str]
 ) -> TParameterization:
     """Filter a dictionary to keys present in a given list."""
     return {k: v for k, v in param_dict.items() if k in subset_keys}
@@ -142,10 +150,11 @@ def _filter_dict(
 
 def _get_in_sample_arms(
     model: ModelBridge,
-    metric_names: Set[str],
-    fixed_features: Optional[ObservationFeatures] = None,
-    data_selector: Optional[Callable[[Observation], bool]] = None,
-) -> Tuple[Dict[str, PlotInSampleArm], RawData, Dict[str, TParameterization]]:
+    metric_names: set[str],
+    fixed_features: ObservationFeatures | None = None,
+    data_selector: Callable[[Observation], bool] | None = None,
+    scalarized_metric_config: list[dict[str, dict[str, float]]] | None = None,
+) -> tuple[dict[str, PlotInSampleArm], RawData, dict[str, TParameterization]]:
     """Get in-sample arms from a model with observed and predicted values
     for specified metrics.
 
@@ -215,10 +224,10 @@ def _get_in_sample_arms(
 
     # Merge multiple measurements within each Observation with IVW to get
     # un-modeled prediction
-    t = IVW(None, [], [])
-    obs_data = t.transform_observation_data([obs.data for obs in observations], [])
+    t = IVW(None, [])
+    observations = t.transform_observations(observations)
     # Start filling in plot data
-    in_sample_plot: Dict[str, PlotInSampleArm] = {}
+    in_sample_plot: dict[str, PlotInSampleArm] = {}
     for i, obs in enumerate(observations):
         if obs.arm_name is None:
             raise ValueError("Observation must have arm name for plotting.")
@@ -226,18 +235,31 @@ def _get_in_sample_arms(
         # Extract raw measurement
         obs_y = {}  # Observed metric means.
         obs_se = {}  # Observed metric standard errors.
-        # Use the IVW data, not obs.data
-        for j, metric_name in enumerate(obs_data[i].metric_names):
+        for j, metric_name in enumerate(obs.data.metric_names):
             if metric_name in metric_names:
-                obs_y[metric_name] = obs_data[i].means[j]
-                obs_se[metric_name] = np.sqrt(obs_data[i].covariance[j, j])
+                obs_y[metric_name] = obs.data.means[j]
+                obs_se[metric_name] = np.sqrt(obs.data.covariance[j, j])
+        # Obtain aggregated outcomes if scalarized_metric_config is provided
+        if scalarized_metric_config is not None:
+            for agg_metric in scalarized_metric_config:
+                agg_metric_name = agg_metric["name"]
+                if agg_metric_name in metric_names:
+                    agg_mean, agg_var = _compute_scalarized_outcome(
+                        mean_dict=obs.data.means_dict,
+                        cov_dict=obs.data.covariance_matrix,
+                        agg_metric_weight_dict=agg_metric["weight"],
+                    )
+                    obs_y[agg_metric_name] = agg_mean
+                    obs_se[agg_metric_name] = np.sqrt(agg_var)
         if training_in_design[i]:
             # Update with the input fixed features
             features = obs.features
             if fixed_features is not None:
                 features.update_features(fixed_features)
             # Make a prediction.
-            pred_y, pred_se = predict_at_point(model, features, metric_names)
+            pred_y, pred_se = predict_at_point(
+                model, features, metric_names, scalarized_metric_config
+            )
         elif (trial_selector is not None) and (
             obs.features.trial_index != trial_selector
         ):
@@ -247,8 +269,8 @@ def _get_in_sample_arms(
         else:
             pred_y = obs_y
             pred_se = obs_se
-        in_sample_plot[not_none(obs.arm_name)] = PlotInSampleArm(
-            name=not_none(obs.arm_name),
+        in_sample_plot[none_throws(obs.arm_name)] = PlotInSampleArm(
+            name=none_throws(obs.arm_name),
             y=obs_y,
             se=obs_se,
             parameters=obs.features.parameters,
@@ -261,10 +283,11 @@ def _get_in_sample_arms(
 
 def _get_out_of_sample_arms(
     model: ModelBridge,
-    generator_runs_dict: Dict[str, GeneratorRun],
-    metric_names: Set[str],
-    fixed_features: Optional[ObservationFeatures] = None,
-) -> Dict[str, Dict[str, PlotOutOfSampleArm]]:
+    generator_runs_dict: dict[str, GeneratorRun],
+    metric_names: set[str],
+    fixed_features: ObservationFeatures | None = None,
+    scalarized_metric_config: list[dict[str, dict[str, float]]] | None = None,
+) -> dict[str, dict[str, PlotOutOfSampleArm]]:
     """Get out-of-sample predictions from a model given a dict of generator runs.
 
     Fixed features input can be used to override fields of the candidate arms
@@ -279,7 +302,7 @@ def _get_out_of_sample_arms(
         A mapping from name to a mapping from arm name to plot.
 
     """
-    out_of_sample_plot: Dict[str, Dict[str, PlotOutOfSampleArm]] = {}
+    out_of_sample_plot: dict[str, dict[str, PlotOutOfSampleArm]] = {}
     for generator_run_name, generator_run in generator_runs_dict.items():
         out_of_sample_plot[generator_run_name] = {}
         for arm in generator_run.arms:
@@ -290,7 +313,9 @@ def _get_out_of_sample_arms(
 
             # Make a prediction
             try:
-                pred_y, pred_se = predict_at_point(model, obsf, metric_names)
+                pred_y, pred_se = predict_at_point(
+                    model, obsf, metric_names, scalarized_metric_config
+                )
             except Exception:
                 # Check if it is an out-of-design arm.
                 if not model.model_space.check_membership(obsf.parameters):
@@ -312,11 +337,12 @@ def _get_out_of_sample_arms(
 
 def get_plot_data(
     model: ModelBridge,
-    generator_runs_dict: Dict[str, GeneratorRun],
-    metric_names: Optional[Set[str]] = None,
-    fixed_features: Optional[ObservationFeatures] = None,
-    data_selector: Optional[Callable[[Observation], bool]] = None,
-) -> Tuple[PlotData, RawData, Dict[str, TParameterization]]:
+    generator_runs_dict: dict[str, GeneratorRun],
+    metric_names: set[str] | None = None,
+    fixed_features: ObservationFeatures | None = None,
+    data_selector: Callable[[Observation], bool] | None = None,
+    scalarized_metric_config: list[dict[str, dict[str, float]]] | None = None,
+) -> tuple[PlotData, RawData, dict[str, TParameterization]]:
     """Format data object with metrics for in-sample and out-of-sample
     arms.
 
@@ -335,6 +361,11 @@ def get_plot_data(
             in the model will be returned.
         fixed_features: Fixed features to use when making model predictions.
         data_selector: Function for selecting observations for plotting.
+        scalarized_metric_config: An optional list of dicts specifying how to aggregate
+            multiple metrics into a single scalarized metric. For each dict, the key is
+            the name of the new scalarized metric, and the value is a dictionary mapping
+            each metric to its weight. e.g.
+            {"name": "metric1:agg", "weight": {"metric1_c1": 0.5, "metric1_c2": 0.5}}.
 
     Returns:
         A tuple containing
@@ -352,19 +383,20 @@ def get_plot_data(
         metric_names=metrics_plot,
         fixed_features=fixed_features,
         data_selector=data_selector,
+        scalarized_metric_config=scalarized_metric_config,
     )
     out_of_sample_plot = _get_out_of_sample_arms(
         model=model,
         generator_runs_dict=generator_runs_dict,
         metric_names=metrics_plot,
         fixed_features=fixed_features,
+        scalarized_metric_config=scalarized_metric_config,
     )
-    status_quo_name = None if model.status_quo is None else model.status_quo.arm_name
     plot_data = PlotData(
         metrics=list(metrics_plot),
         in_sample=in_sample_plot,
         out_of_sample=out_of_sample_plot,
-        status_quo_name=status_quo_name,
+        status_quo_name=model.status_quo_name,
     )
     return plot_data, raw_data, cond_name_to_parameters
 
@@ -391,23 +423,45 @@ def get_range_parameter(model: ModelBridge, param_name: str) -> RangeParameter:
     return range_param
 
 
-def get_range_parameters(model: ModelBridge) -> List[RangeParameter]:
+def get_range_parameters_from_list(
+    parameters: list[Parameter], min_num_values: int = 0
+) -> list[RangeParameter]:
     """
     Get a list of range parameters from a model.
 
     Args:
-        model: The model.
+        parameters: List of parameters
+        min_num_values: Minimum number of values
 
     Returns: List of RangeParameters.
     """
     return [
         parameter
-        for parameter in model.model_space.parameters.values()
+        for parameter in parameters
         if isinstance(parameter, RangeParameter)
+        and parameter.cardinality() >= min_num_values  # float has inf cardinality
     ]
 
 
-def get_grid_for_parameter(parameter: RangeParameter, density: int) -> np.ndarray:
+def get_range_parameters(
+    model: ModelBridge, min_num_values: int = 0
+) -> list[RangeParameter]:
+    """
+    Get a list of range parameters from a model.
+
+    Args:
+        model: The model.
+        min_num_values: Minimum number of values
+
+    Returns: List of RangeParameters.
+    """
+    return get_range_parameters_from_list(
+        parameters=list(model.model_space.parameters.values()),
+        min_num_values=min_num_values,
+    )
+
+
+def get_grid_for_parameter(parameter: RangeParameter, density: int) -> npt.NDArray:
     """Get a grid of points along the range of the parameter.
 
     Will be a log-scale grid if parameter is log scale.
@@ -421,7 +475,7 @@ def get_grid_for_parameter(parameter: RangeParameter, density: int) -> np.ndarra
         grid = np.linspace(
             np.log10(parameter.lower), np.log10(parameter.upper), density
         )
-        grid = 10 ** grid
+        grid = 10**grid
     else:
         grid = np.linspace(parameter.lower, parameter.upper, density)
     return grid
@@ -429,8 +483,8 @@ def get_grid_for_parameter(parameter: RangeParameter, density: int) -> np.ndarra
 
 def get_fixed_values(
     model: ModelBridge,
-    slice_values: Optional[Dict[str, Any]] = None,
-    trial_index: Optional[int] = None,
+    slice_values: dict[str, Any] | None = None,
+    trial_index: int | None = None,
 ) -> TParameterization:
     """Get fixed values for parameters in a slice plot.
 
@@ -475,6 +529,7 @@ def get_fixed_values(
             elif isinstance(parameter, ChoiceParameter):
                 setx[p_name] = Counter(vals).most_common(1)[0][0]
             elif isinstance(parameter, RangeParameter):
+                # pyre-fixme[6]: For 1st argument expected `Union[_SupportsArray[dtyp...
                 setx[p_name] = parameter.cast(np.mean(vals))
 
     if slice_values is not None:
@@ -484,7 +539,8 @@ def get_fixed_values(
 
 
 # Utility methods ported from JS
-def contour_config_to_trace(config):
+# pyre-fixme[2]: Parameter must be annotated.
+def contour_config_to_trace(config) -> list[dict[str, Any]]:
     # Load from config
     arm_data = config["arm_data"]
     density = config["density"]
@@ -610,7 +666,12 @@ def contour_config_to_trace(config):
 
     sd_in_sample_arm_trace = {"showlegend": False, "xaxis": "x2", "yaxis": "y2"}
 
+    # pyre-fixme[6]: For 1st param expected `SupportsKeysAndGetItem[str, str]` but
+    #  got `Dict[str, Union[Dict[str, Union[float, str]], List[typing.Any], str]]`.
     f_in_sample_arm_trace.update(base_in_sample_arm_config)
+    # pyre-fixme[6]: For 1st param expected `SupportsKeysAndGetItem[str, Union[bool,
+    #  str]]` but got `Dict[str, Union[Dict[str, Union[float, str]], List[typing.Any],
+    #  str]]`.
     sd_in_sample_arm_trace.update(base_in_sample_arm_config)
 
     traces = [f_trace, sd_trace, f_in_sample_arm_trace, sd_in_sample_arm_trace]
@@ -671,22 +732,27 @@ def contour_config_to_trace(config):
     return traces
 
 
-def axis_range(grid: List[float], is_log: bool) -> List[float]:
+def axis_range(grid: list[float], is_log: bool) -> list[float]:
     if is_log:
         return [math.log10(min(grid)), math.log10(max(grid))]
     else:
         return [min(grid), max(grid)]
 
 
-def relativize(m_t: float, sem_t: float, m_c: float, sem_c: float) -> List[float]:
-    r_hat = (m_t - m_c) / abs(m_c) - sem_c ** 2 * m_t / abs(m_c) ** 3
-    variance = (sem_t ** 2 + (m_t / m_c * sem_c) ** 2) / m_c ** 2
+def relativize(m_t: float, sem_t: float, m_c: float, sem_c: float) -> list[float]:
+    r_hat = (m_t - m_c) / abs(m_c) - sem_c**2 * m_t / abs(m_c) ** 3
+    variance = (sem_t**2 + (m_t / m_c * sem_c) ** 2) / m_c**2
     return [r_hat, math.sqrt(variance)]
 
 
 def relativize_data(
-    f: List[float], sd: List[float], rel: bool, arm_data: Dict[Any, Any], metric: str
-) -> List[List[float]]:
+    f: list[float],
+    sd: list[float],
+    rel: bool,
+    # pyre-fixme[2]: Parameter annotation cannot contain `Any`.
+    arm_data: dict[Any, Any],
+    metric: str,
+) -> list[list[float]]:
     # if relative, extract status quo & compute ratio
     f_final = [] if rel else f
     sd_final = [] if rel else sd
@@ -703,13 +769,13 @@ def relativize_data(
     return [f_final, sd_final]
 
 
-def rgb(arr: List[int]) -> str:
+def rgb(arr: list[int]) -> str:
     return "rgb({},{},{})".format(*arr)
 
 
 def infer_is_relative(
-    model: ModelBridge, metrics: List[str], non_constraint_rel: bool
-) -> Dict[str, bool]:
+    model: ModelBridge, metrics: list[str], non_constraint_rel: bool
+) -> dict[str, bool]:
     """Determine whether or not to relativize a metric.
 
     Metrics that are constraints will get this decision from their `relative` flag.
@@ -726,7 +792,7 @@ def infer_is_relative(
     relative = {}
     constraint_relativity = {}
     if model._optimization_config:
-        constraints = not_none(model._optimization_config).outcome_constraints
+        constraints = none_throws(model._optimization_config).outcome_constraints
         constraint_relativity = {
             constraint.metric.name: constraint.relative for constraint in constraints
         }
@@ -739,19 +805,27 @@ def infer_is_relative(
 
 
 def slice_config_to_trace(
+    # pyre-fixme[2]: Parameter must be annotated.
     arm_data,
+    # pyre-fixme[2]: Parameter must be annotated.
     arm_name_to_parameters,
-    f,
+    f: list[float],
+    # pyre-fixme[2]: Parameter must be annotated.
     fit_data,
+    # pyre-fixme[2]: Parameter must be annotated.
     grid,
-    metric,
+    metric: str,
+    # pyre-fixme[2]: Parameter must be annotated.
     param,
-    rel,
+    rel: bool,
+    # pyre-fixme[2]: Parameter must be annotated.
     setx,
-    sd,
+    sd: list[float],
+    # pyre-fixme[2]: Parameter must be annotated.
     is_log,
+    # pyre-fixme[2]: Parameter must be annotated.
     visible,
-):
+) -> list[dict[str, Any]]:
     # format data
     res = relativize_data(f, sd, rel, arm_data, metric)
     f_final = res[0]
@@ -885,7 +959,7 @@ def slice_config_to_trace(
     return traces
 
 
-def build_filter_trial(keep_trial_indices: List[int]) -> Callable[[Observation], bool]:
+def build_filter_trial(keep_trial_indices: list[int]) -> Callable[[Observation], bool]:
     """Creates a callable that filters observations based on trial_index"""
 
     def trial_filter(obs: Observation) -> bool:
@@ -896,7 +970,7 @@ def build_filter_trial(keep_trial_indices: List[int]) -> Callable[[Observation],
 
 def compose_annotation(
     caption: str, x: float = 0.0, y: float = -0.15
-) -> List[Dict[str, Any]]:
+) -> list[dict[str, Any]]:
     if not caption:
         return []
     return [

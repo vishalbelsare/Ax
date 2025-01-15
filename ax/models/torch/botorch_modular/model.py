@@ -4,33 +4,40 @@
 # This source code is licensed under the MIT license found in the
 # LICENSE file in the root directory of this source tree.
 
-import dataclasses
-from copy import deepcopy
-from typing import Any, Callable, Dict, List, Optional, Tuple, Type
+# pyre-strict
 
+import dataclasses
+import warnings
+from collections import OrderedDict
+from collections.abc import Mapping, Sequence
+from typing import Any
+
+import numpy.typing as npt
 import torch
 from ax.core.search_space import SearchSpaceDigest
 from ax.core.types import TCandidateMetadata, TGenMetadata
-from ax.models.torch.botorch import get_rounding_func
+from ax.exceptions.core import UnsupportedError, UserInputError
+from ax.models.torch.botorch import (
+    get_feature_importances_from_botorch_model,
+    get_rounding_func,
+)
 from ax.models.torch.botorch_modular.acquisition import Acquisition
-from ax.models.torch.botorch_modular.list_surrogate import ListSurrogate
-from ax.models.torch.botorch_modular.surrogate import Surrogate
+from ax.models.torch.botorch_modular.surrogate import Surrogate, SurrogateSpec
 from ax.models.torch.botorch_modular.utils import (
+    check_outcome_dataset_match,
     choose_botorch_acqf_class,
-    choose_model_class,
     construct_acquisition_and_optimizer_options,
-    use_model_list,
-    validate_data_format,
+    ModelConfig,
 )
 from ax.models.torch.utils import _to_inequality_constraints
-from ax.models.torch_base import TorchModel
-from ax.models.types import TConfig
+from ax.models.torch_base import TorchGenResults, TorchModel, TorchOptConfig
 from ax.utils.common.base import Base
 from ax.utils.common.constants import Keys
 from ax.utils.common.docutils import copy_doc
-from ax.utils.common.typeutils import checked_cast, not_none
+from ax.utils.common.typeutils import checked_cast
 from botorch.acquisition.acquisition import AcquisitionFunction
-from botorch.utils.containers import TrainingData
+from botorch.models.deterministic import FixedSingleSampleModel
+from botorch.utils.datasets import SupervisedDataset
 from torch import Tensor
 
 
@@ -39,400 +46,361 @@ class BoTorchModel(TorchModel, Base):
     construction, incomplete, and should be treated as alpha
     versions only.**
 
-    Modular `Model` class for combining BoTorch subcomponents
-    in Ax. Specified via `Surrogate` and `Acquisition`, which wrap
-    BoTorch `Model` and `AcquisitionFunction`, respectively, for
+    Modular ``Model`` class for combining BoTorch subcomponents
+    in Ax. Specified via ``Surrogate`` and ``Acquisition``, which wrap
+    BoTorch ``Model`` and ``AcquisitionFunction``, respectively, for
     convenient use in Ax.
 
     Args:
-        acquisition_class: Type of `Acquisition` to be used in
+        acquisition_class: Type of ``Acquisition`` to be used in
             this model, auto-selected based on experiment and data
             if not specified.
         acquisition_options: Optional dict of kwargs, passed to
-            the constructor of BoTorch `AcquisitionFunction`.
-        botorch_acqf_class: Type of `AcquisitionFunction` to be
+            the constructor of BoTorch ``AcquisitionFunction``.
+        botorch_acqf_class: Type of ``AcquisitionFunction`` to be
             used in this model, auto-selected based on experiment
             and data if not specified.
-        surrogate: An instance of `Surrogate` to be used as part of
-            this model; if not specified, type of `Surrogate` and
-            underlying BoTorch `Model` will be auto-selected based
-            on experiment and data, with kwargs in `surrogate_options`
-            applied.
-        surrogate_options: Optional dict of kwargs for `Surrogate`
-            (used if no pre-instantiated Surrogate via is passed via `surrogate`).
-            Can include:
-            - model_options: Dict of options to surrogate's underlying
-            BoTorch `Model`,
-            - submodel_options or submodel_options_per_outcome:
-            Options for submodels in `ListSurrogate`, see documentation
-            for `ListSurrogate`.
-        refit_on_update: Whether to reoptimize model parameters during call
-            to `BoTorchModel.update`. If false, training data for the model
-            (used for inference) is still swapped for new training data, but
-            model parameters are not reoptimized.
+        surrogate_spec: An optional ``SurrogateSpec`` object specifying how to
+            construct the ``Surrogate`` and the underlying BoTorch ``Model``.
+        surrogate_specs: DEPRECATED. Please use ``surrogate_spec`` instead.
+        surrogate: In lieu of ``SurrogateSpec``, an instance of ``Surrogate`` may
+            be provided. In most cases, ``surrogate_spec`` should be used instead.
         refit_on_cv: Whether to reoptimize model parameters during call to
-            `BoTorchmodel.cross_validate`.
+            ``BoTorchmodel.cross_validate``.
         warm_start_refit: Whether to load parameters from either the provided
-            state dict or the state dict of the current BoTorch `Model` during
+            state dict or the state dict of the current BoTorch ``Model`` during
             refitting. If False, model parameters will be reoptimized from
-            scratch on refit. NOTE: This setting is ignored during `update` or
-            `cross_validate` if the corresponding `refit_on_...` is False.
+            scratch on refit. NOTE: This setting is ignored during
+            ``cross_validate`` if ``refit_on_cv`` is False.
     """
 
-    acquisition_class: Type[Acquisition]
-    acquisition_options: Dict[str, Any]
-    surrogate_options: Dict[str, Any]
-    _surrogate: Optional[Surrogate]
-    _botorch_acqf_class: Optional[Type[AcquisitionFunction]]
-    _search_space_digest: Optional[SearchSpaceDigest] = None
+    acquisition_class: type[Acquisition]
+    acquisition_options: dict[str, Any]
+
+    surrogate_spec: SurrogateSpec | None
+    _surrogate: Surrogate | None
+
+    _botorch_acqf_class: type[AcquisitionFunction] | None
+    _search_space_digest: SearchSpaceDigest | None = None
+    _supports_robust_optimization: bool = True
 
     def __init__(
         self,
-        acquisition_class: Optional[Type[Acquisition]] = None,
-        acquisition_options: Optional[Dict[str, Any]] = None,
-        botorch_acqf_class: Optional[Type[AcquisitionFunction]] = None,
-        surrogate: Optional[Surrogate] = None,
-        surrogate_options: Optional[Dict[str, Any]] = None,
-        refit_on_update: bool = True,
+        surrogate_spec: SurrogateSpec | None = None,
+        surrogate_specs: Mapping[str, SurrogateSpec] | None = None,
+        surrogate: Surrogate | None = None,
+        acquisition_class: type[Acquisition] | None = None,
+        acquisition_options: dict[str, Any] | None = None,
+        botorch_acqf_class: type[AcquisitionFunction] | None = None,
         refit_on_cv: bool = False,
         warm_start_refit: bool = True,
     ) -> None:
-        self._surrogate = surrogate
-        if surrogate and surrogate_options:
-            raise ValueError(  # pragma: no cover
-                "`surrogate_options` are only applied when using the default "
-                "surrogate, so only one of `surrogate` and `surrogate_options`"
-                " arguments is expected."
+        # Check that only one surrogate related option is provided.
+        if bool(surrogate_spec) + bool(surrogate_specs) + bool(surrogate) > 1:
+            raise UserInputError(
+                "Only one of `surrogate_spec`, `surrogate_specs`, and `surrogate` "
+                "can be specified. Please use `surrogate_spec`."
             )
-        self.surrogate_options = surrogate_options or {}
+        if surrogate_specs is not None:
+            if len(surrogate_specs) > 1:
+                raise DeprecationWarning(
+                    "Support for multiple `Surrogate`s has been deprecated. "
+                    "Please use the `surrogate_spec` input in the future to "
+                    "specify a single `Surrogate`."
+                )
+            warnings.warn(
+                "The `surrogate_specs` argument is deprecated in favor of "
+                "`surrogate_spec`, which accepts a single `SurrogateSpec` object. "
+                "Please use `surrogate_spec` in the future.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            surrogate_spec = next(iter(surrogate_specs.values()))
+        self.surrogate_spec = surrogate_spec
+        self._surrogate = surrogate
+
         self.acquisition_class = acquisition_class or Acquisition
-        # `_botorch_acqf_class` can be `None` here. If so, `Model.gen` or `Model.
-        # evaluate_acquisition_function` will set it with `choose_botorch_acqf_class`.
-        self._botorch_acqf_class = botorch_acqf_class
         self.acquisition_options = acquisition_options or {}
-        self.refit_on_update = refit_on_update
+        self._botorch_acqf_class = botorch_acqf_class
+
         self.refit_on_cv = refit_on_cv
         self.warm_start_refit = warm_start_refit
 
     @property
     def surrogate(self) -> Surrogate:
-        """Ax ``Surrogate`` object (wrapper for BoTorch ``Model``), associated with
-        this model. Raises an error if one is not yet set.
-        """
-        if not self._surrogate:
-            raise ValueError("Surrogate has not yet been set.")
-        return not_none(self._surrogate)
+        """Returns the ``Surrogate``, if it has been constructed."""
+        if self._surrogate is None:
+            raise ValueError("Surrogate has not yet been constructed.")
+        return self._surrogate
 
     @property
-    def botorch_acqf_class(self) -> Type[AcquisitionFunction]:
+    def Xs(self) -> list[Tensor]:
+        """A list of tensors, each of shape ``batch_shape x n_i x d``,
+        where `n_i` is the number of training inputs for the i-th model.
+
+        NOTE: This is an accessor for ``self.surrogate.Xs``
+        and returns it unchanged.
+        """
+        return self.surrogate.Xs
+
+    @property
+    def botorch_acqf_class(self) -> type[AcquisitionFunction]:
         """BoTorch ``AcquisitionFunction`` class, associated with this model.
         Raises an error if one is not yet set.
         """
         if not self._botorch_acqf_class:
             raise ValueError("BoTorch `AcquisitionFunction` has not yet been set.")
-        return not_none(self._botorch_acqf_class)
+        return self._botorch_acqf_class
 
-    @property
-    def Xs(self) -> List[Tensor]:
-        """A list of tensors, each of shape ``batch_shape x n_i x d``,
-        where `n_i` is the number of training inputs for the i-th model.
-
-        NOTE: This is an accessor for ``self.surrogate.training_data.Xs``
-        and returns it unchanged.
-        """
-        return self.surrogate.training_data.Xs
-
-    @property
-    def Ys(self) -> List[Tensor]:
-        """A list of tensors, each of shape ``batch_shape x n_i x 1``,
-        where `n_i` is the number of training observations for the i-th
-        (single-output) model.
-
-        NOTE: This is an accessor for ``self.surrogate.training_data.Ys``
-        and returns it unchanged.
-        """
-        return self.surrogate.training_data.Ys
-
-    @property
-    def Yvars(self) -> Optional[List[Tensor]]:
-        """An optional list of tensors, each of shape
-        ``batch_shape x n_i x 1``, where ``n_i`` is the number of training
-        observations of the  observation noise for the i-th  (single-output)
-        model. If `None`, the observation noise level is unobserved.
-
-        NOTE: This is an accessor for ``self.surrogate.training_data.Yvars``
-        and returns it unchanged.
-        """
-        return self.surrogate.training_data.Yvars
-
-    @copy_doc(TorchModel.fit)
     def fit(
         self,
-        Xs: List[Tensor],
-        Ys: List[Tensor],
-        Yvars: List[Tensor],
+        datasets: Sequence[SupervisedDataset],
         search_space_digest: SearchSpaceDigest,
-        metric_names: List[str],
-        target_fidelities: Optional[Dict[int, float]] = None,
-        candidate_metadata: Optional[List[List[TCandidateMetadata]]] = None,
-        state_dict: Optional[Dict[str, Tensor]] = None,
+        candidate_metadata: list[list[TCandidateMetadata]] | None = None,
+        state_dict: OrderedDict[str, Tensor] | None = None,
         refit: bool = True,
+        **additional_model_inputs: Any,
     ) -> None:
-        # Ensure that parts of data all have equal lengths.
-        validate_data_format(Xs=Xs, Ys=Ys, Yvars=Yvars, metric_names=metric_names)
+        """Fit model to m outcomes.
 
-        # store search space info for later use (e.g. during generation)
+        Args:
+            datasets: A list of ``SupervisedDataset`` containers, each
+                corresponding to the data of one or more outcomes.
+            search_space_digest: A ``SearchSpaceDigest`` object containing
+                metadata on the features in the datasets.
+            candidate_metadata: Model-produced metadata for candidates, in
+                the order corresponding to the Xs.
+            state_dict: An optional model statedict for the underlying ``Surrogate``.
+                Primarily used in ``BoTorchModel.cross_validate``.
+            refit: Whether to re-optimize model parameters.
+            additional_model_inputs: Additional kwargs to pass to the
+                model input constructor in ``Surrogate.fit``.
+        """
+        outcome_names = sum((ds.outcome_names for ds in datasets), [])
+        check_outcome_dataset_match(
+            outcome_names=outcome_names, datasets=datasets, exact_match=True
+        )  # Checks for duplicate outcome names
+
+        # Store search space info for later use (e.g. during generation)
         self._search_space_digest = search_space_digest
 
-        # Choose `Surrogate` and undelying `Model` based on properties of data.
-        if not self._surrogate:
-            self._autoset_surrogate(
-                Xs=Xs,
-                Ys=Ys,
-                Yvars=Yvars,
-                search_space_digest=search_space_digest,
-                metric_names=metric_names,
+        # If a surrogate has not been constructed, construct it.
+        if self._surrogate is None:
+            surrogate_spec = (
+                SurrogateSpec(model_configs=[ModelConfig(name="default")])
+                if self.surrogate_spec is None
+                else self.surrogate_spec
+            )
+            self._surrogate = Surrogate(
+                surrogate_spec=surrogate_spec, refit_on_cv=self.refit_on_cv
             )
 
+        # Fit the surrogate.
+        for config in self.surrogate.surrogate_spec.model_configs:
+            config.model_options.update(additional_model_inputs)
+        for (
+            config_list
+        ) in self.surrogate.surrogate_spec.metric_to_model_configs.values():
+            for config in config_list:
+                config.model_options.update(additional_model_inputs)
         self.surrogate.fit(
-            training_data=TrainingData(Xs=Xs, Ys=Ys, Yvars=Yvars),
+            datasets=datasets,
             search_space_digest=search_space_digest,
-            metric_names=metric_names,
             candidate_metadata=candidate_metadata,
             state_dict=state_dict,
             refit=refit,
         )
 
-    @copy_doc(TorchModel.update)
-    def update(
-        self,
-        Xs: List[Tensor],
-        Ys: List[Tensor],
-        Yvars: List[Tensor],
-        search_space_digest: SearchSpaceDigest,
-        metric_names: List[str],
-        candidate_metadata: Optional[List[List[TCandidateMetadata]]] = None,
-    ) -> None:
-        if not self._surrogate:
-            raise ValueError("Cannot update model that has not been fitted.")
+    def predict(
+        self, X: Tensor, use_posterior_predictive: bool = False
+    ) -> tuple[Tensor, Tensor]:
+        """Predicts, potentially from multiple surrogates.
 
-        # store search space info  for later use (e.g. during generation)
-        self._search_space_digest = search_space_digest
+        Args:
+            X: (n x d) Tensor of input locations.
+            use_posterior_predictive: A boolean indicating if the predictions
+                should be from the posterior predictive (i.e. including
+                observation noise).
 
-        # Sometimes the model fit should be restarted from scratch on update, for models
-        # that are prone to overfitting. In those cases, `self.warm_start_refit` should
-        # be false and `Surrogate.update` will not receive a state dict and will not
-        # pass it to the underlying `Surrogate.fit`.
-        state_dict = (
-            None
-            if self.refit_on_update and not self.warm_start_refit
-            else self.surrogate.model.state_dict()
+        Returns: Tuple of tensors: (n x m) mean, (n x m x m) covariance.
+        """
+        return self.surrogate.predict(
+            X=X, use_posterior_predictive=use_posterior_predictive
         )
-
-        self.surrogate.update(
-            training_data=TrainingData(Xs=Xs, Ys=Ys, Yvars=Yvars),
-            search_space_digest=search_space_digest,
-            metric_names=metric_names,
-            candidate_metadata=candidate_metadata,
-            state_dict=state_dict,
-            refit=self.refit_on_update,
-        )
-
-    @copy_doc(TorchModel.predict)
-    def predict(self, X: Tensor) -> Tuple[Tensor, Tensor]:
-        return self.surrogate.predict(X=X)
 
     @copy_doc(TorchModel.gen)
     def gen(
         self,
         n: int,
-        bounds: List[Tuple[float, float]],
-        objective_weights: Tensor,
-        objective_thresholds: Optional[Tensor] = None,
-        outcome_constraints: Optional[Tuple[Tensor, Tensor]] = None,
-        linear_constraints: Optional[Tuple[Tensor, Tensor]] = None,
-        fixed_features: Optional[Dict[int, float]] = None,
-        pending_observations: Optional[List[Tensor]] = None,
-        model_gen_options: Optional[TConfig] = None,
-        rounding_func: Optional[Callable[[Tensor], Tensor]] = None,
-        target_fidelities: Optional[Dict[int, float]] = None,
-    ) -> Tuple[Tensor, Tensor, TGenMetadata, Optional[List[TCandidateMetadata]]]:
-        if self._search_space_digest is None:
-            raise RuntimeError("Must `fit` the model before calling `gen`.")
+        search_space_digest: SearchSpaceDigest,
+        torch_opt_config: TorchOptConfig,
+    ) -> TorchGenResults:
         acq_options, opt_options = construct_acquisition_and_optimizer_options(
-            acqf_options=self.acquisition_options, model_gen_options=model_gen_options
+            acqf_options=self.acquisition_options,
+            model_gen_options=torch_opt_config.model_gen_options,
         )
-        # update bounds / target fidelities
-        new_ssd_args = {
-            **dataclasses.asdict(self._search_space_digest),
-            "bounds": bounds,
-            "target_fidelities": target_fidelities or {},
-        }
-        search_space_digest = SearchSpaceDigest(**new_ssd_args)
+        # update bounds / target values
+        search_space_digest = dataclasses.replace(
+            self.search_space_digest,
+            bounds=search_space_digest.bounds,
+            target_values=search_space_digest.target_values or {},
+        )
 
         acqf = self._instantiate_acquisition(
             search_space_digest=search_space_digest,
-            objective_weights=objective_weights,
-            objective_thresholds=objective_thresholds,
-            outcome_constraints=outcome_constraints,
-            linear_constraints=linear_constraints,
-            fixed_features=fixed_features,
-            pending_observations=pending_observations,
+            torch_opt_config=torch_opt_config,
             acq_options=acq_options,
         )
-        botorch_rounding_func = get_rounding_func(rounding_func)
-        candidates, expected_acquisition_value = acqf.optimize(
+        botorch_rounding_func = get_rounding_func(torch_opt_config.rounding_func)
+        candidates, expected_acquisition_value, weights = acqf.optimize(
             n=n,
             search_space_digest=search_space_digest,
             inequality_constraints=_to_inequality_constraints(
-                linear_constraints=linear_constraints
+                linear_constraints=torch_opt_config.linear_constraints
             ),
-            fixed_features=fixed_features,
+            fixed_features=torch_opt_config.fixed_features,
             rounding_func=botorch_rounding_func,
             optimizer_options=checked_cast(dict, opt_options),
         )
+        gen_metadata = self._get_gen_metadata_from_acqf(
+            acqf=acqf,
+            torch_opt_config=torch_opt_config,
+            expected_acquisition_value=expected_acquisition_value,
+        )
+        # log what model was used
+        metric_to_model_config_name = {
+            metric_name: model_config.name or str(model_config)
+            for metric_name, model_config in (
+                self.surrogate.metric_to_best_model_config.items()
+            )
+        }
+        gen_metadata["metric_to_model_config_name"] = metric_to_model_config_name
+        return TorchGenResults(
+            points=candidates.detach().cpu(),
+            weights=weights,
+            gen_metadata=gen_metadata,
+        )
+
+    def _get_gen_metadata_from_acqf(
+        self,
+        acqf: Acquisition,
+        torch_opt_config: TorchOptConfig,
+        expected_acquisition_value: Tensor,
+    ) -> TGenMetadata:
         gen_metadata: TGenMetadata = {
             Keys.EXPECTED_ACQF_VAL: expected_acquisition_value.tolist()
         }
-        if objective_weights.nonzero().numel() > 1:
+        if torch_opt_config.objective_weights.nonzero().numel() > 1:
             gen_metadata["objective_thresholds"] = acqf.objective_thresholds
             gen_metadata["objective_weights"] = acqf.objective_weights
-        return (
-            candidates.detach().cpu(),
-            torch.ones(n, dtype=self.surrogate.dtype),
-            gen_metadata,
-            None,
-        )
+
+        if hasattr(acqf.acqf, "outcome_model"):
+            outcome_model = acqf.acqf.outcome_model
+            if isinstance(
+                outcome_model,
+                FixedSingleSampleModel,
+            ):
+                gen_metadata["outcome_model_fixed_draw_weights"] = outcome_model.w
+        return gen_metadata
 
     @copy_doc(TorchModel.best_point)
     def best_point(
         self,
-        bounds: List[Tuple[float, float]],
-        objective_weights: Tensor,
-        outcome_constraints: Optional[Tuple[Tensor, Tensor]] = None,
-        linear_constraints: Optional[Tuple[Tensor, Tensor]] = None,
-        fixed_features: Optional[Dict[int, float]] = None,
-        model_gen_options: Optional[TConfig] = None,
-        target_fidelities: Optional[Dict[int, float]] = None,
-    ) -> Optional[Tensor]:
-        raise NotImplementedError("Coming soon.")
+        search_space_digest: SearchSpaceDigest,
+        torch_opt_config: TorchOptConfig,
+    ) -> Tensor | None:
+        try:
+            return self.surrogate.best_in_sample_point(
+                search_space_digest=search_space_digest,
+                torch_opt_config=torch_opt_config,
+            )[0]
+        except ValueError:
+            return None
 
     @copy_doc(TorchModel.evaluate_acquisition_function)
     def evaluate_acquisition_function(
         self,
         X: Tensor,
         search_space_digest: SearchSpaceDigest,
-        objective_weights: Tensor,
-        objective_thresholds: Optional[Tensor] = None,
-        outcome_constraints: Optional[Tuple[Tensor, Tensor]] = None,
-        linear_constraints: Optional[Tuple[Tensor, Tensor]] = None,
-        fixed_features: Optional[Dict[int, float]] = None,
-        pending_observations: Optional[List[Tensor]] = None,
-        acq_options: Optional[Dict[str, Any]] = None,
+        torch_opt_config: TorchOptConfig,
+        acq_options: dict[str, Any] | None = None,
     ) -> Tensor:
         acqf = self._instantiate_acquisition(
             search_space_digest=search_space_digest,
-            objective_weights=objective_weights,
-            objective_thresholds=objective_thresholds,
-            outcome_constraints=outcome_constraints,
-            linear_constraints=linear_constraints,
-            fixed_features=fixed_features,
-            pending_observations=pending_observations,
+            torch_opt_config=torch_opt_config,
             acq_options=acq_options,
         )
         return acqf.evaluate(X=X)
 
+    @copy_doc(TorchModel.cross_validate)
     def cross_validate(
         self,
-        Xs_train: List[Tensor],
-        Ys_train: List[Tensor],
-        Yvars_train: List[Tensor],
+        datasets: Sequence[SupervisedDataset],
         X_test: Tensor,
         search_space_digest: SearchSpaceDigest,
-        metric_names: List[str],
-    ) -> Tuple[Tensor, Tensor]:
+        use_posterior_predictive: bool = False,
+        **additional_model_inputs: Any,
+    ) -> tuple[Tensor, Tensor]:
         current_surrogate = self.surrogate
         # If we should be refitting but not warm-starting the refit, set
         # `state_dict` to None to avoid loading it.
         state_dict = (
             None
             if self.refit_on_cv and not self.warm_start_refit
-            else deepcopy(current_surrogate.model.state_dict())
+            else current_surrogate.model.state_dict()
         )
 
         # Temporarily set `_surrogate` to cloned surrogate to set
         # the training data on cloned surrogate to train set and
         # use it to predict the test point.
-        surrogate_clone = self.surrogate.clone_reset()
-        self._surrogate = surrogate_clone
+        self._surrogate = current_surrogate.clone_reset()
+
+        # Remove the `robust_digest` since we do not want to use perturbations here.
+        search_space_digest = dataclasses.replace(
+            search_space_digest,
+            robust_digest=None,
+        )
 
         try:
             self.fit(
-                Xs=Xs_train,
-                Ys=Ys_train,
-                Yvars=Yvars_train,
+                datasets=datasets,
                 search_space_digest=search_space_digest,
-                metric_names=metric_names,
+                # pyre-fixme [6]: state_dict() has a generic dict[str, Any] return type
+                # but it is actually an OrderedDict[str, Tensor].
                 state_dict=state_dict,
                 refit=self.refit_on_cv,
+                **additional_model_inputs,
             )
-            X_test_prediction = self.predict(X=X_test)
+            X_test_prediction = self.predict(
+                X=X_test,
+                use_posterior_predictive=use_posterior_predictive,
+            )
         finally:
-            # Reset the surrogate back to this model's surrogate, make
+            # Reset the surrogates back to this model's surrogate, make
             # sure the cloned surrogate doesn't stay around if fit or
             # predict fail.
             self._surrogate = current_surrogate
         return X_test_prediction
 
-    def _autoset_surrogate(
-        self,
-        Xs: List[Tensor],
-        Ys: List[Tensor],
-        Yvars: List[Tensor],
-        search_space_digest: SearchSpaceDigest,
-        metric_names: List[str],
-    ) -> None:
-        """Sets a default surrogate on this model if one was not explicitly
-        provided.
+    @property
+    def dtype(self) -> torch.dtype:
+        """Torch data type of the tensors in the training data used in the model,
+        of which this ``Acquisition`` is a subcomponent.
         """
-        # To determine whether to use `ListSurrogate`, we need to check for
-        # the batched multi-output case, so we first see which model would
-        # be chosen given the Yvars and the properties of data.
-        botorch_model_class = choose_model_class(
-            Yvars=Yvars,
-            search_space_digest=search_space_digest,
-        )
-        if use_model_list(Xs=Xs, botorch_model_class=botorch_model_class):
-            # If using `ListSurrogate` / `ModelListGP`, pick submodels for each
-            # outcome.
-            botorch_submodel_class_per_outcome = {
-                metric_name: choose_model_class(
-                    Yvars=[Yvar],
-                    search_space_digest=search_space_digest,
-                )
-                for Yvar, metric_name in zip(Yvars, metric_names)
-            }
-            self._surrogate = ListSurrogate(
-                botorch_submodel_class_per_outcome=botorch_submodel_class_per_outcome,
-                **self.surrogate_options,
-            )
-        else:
-            # Using regular `Surrogate`, so botorch model picked at the beginning
-            # of the function is the one we should use.
-            self._surrogate = Surrogate(
-                botorch_model_class=botorch_model_class, **self.surrogate_options
-            )
+        return self.surrogate.dtype
+
+    @property
+    def device(self) -> torch.device:
+        """Torch device type of the tensors in the training data used in the model,
+        of which this ``Acquisition`` is a subcomponent.
+        """
+        return self.surrogate.device
 
     def _instantiate_acquisition(
         self,
         search_space_digest: SearchSpaceDigest,
-        objective_weights: Tensor,
-        objective_thresholds: Optional[Tensor] = None,
-        outcome_constraints: Optional[Tuple[Tensor, Tensor]] = None,
-        linear_constraints: Optional[Tuple[Tensor, Tensor]] = None,
-        fixed_features: Optional[Dict[int, float]] = None,
-        pending_observations: Optional[List[Tensor]] = None,
-        acq_options: Optional[Dict[str, Any]] = None,
+        torch_opt_config: TorchOptConfig,
+        acq_options: dict[str, Any] | None = None,
     ) -> Acquisition:
         """Set a BoTorch acquisition function class for this model if needed and
         instantiate it.
@@ -441,23 +409,44 @@ class BoTorchModel(TorchModel, Base):
             A BoTorch ``AcquisitionFunction`` instance.
         """
         if not self._botorch_acqf_class:
+            if torch_opt_config.risk_measure is not None:
+                raise UnsupportedError(
+                    "Automated selection of `botorch_acqf_class` is not supported "
+                    "for robust optimization with risk measures. Please specify "
+                    "`botorch_acqf_class` as part of `model_kwargs`."
+                )
             self._botorch_acqf_class = choose_botorch_acqf_class(
-                objective_thresholds=objective_thresholds,
-                outcome_constraints=outcome_constraints,
-                linear_constraints=linear_constraints,
-                fixed_features=fixed_features,
-                pending_observations=pending_observations,
-                objective_weights=objective_weights,
+                torch_opt_config=torch_opt_config
             )
+
         return self.acquisition_class(
             surrogate=self.surrogate,
             botorch_acqf_class=self.botorch_acqf_class,
             search_space_digest=search_space_digest,
-            objective_weights=objective_weights,
-            objective_thresholds=objective_thresholds,
-            outcome_constraints=outcome_constraints,
-            linear_constraints=linear_constraints,
-            fixed_features=fixed_features,
-            pending_observations=pending_observations,
+            torch_opt_config=torch_opt_config,
             options=acq_options,
         )
+
+    def feature_importances(self) -> npt.NDArray:
+        """Compute feature importances from the model.
+
+        This assumes that we can get model lengthscales from either
+        ``covar_module.base_kernel.lengthscale`` or ``covar_module.lengthscale``.
+
+        Returns:
+            The feature importances as a numpy array of size len(metrics) x 1 x dim
+            where each row sums to 1.
+        """
+        return get_feature_importances_from_botorch_model(model=self.surrogate.model)
+
+    @property
+    def search_space_digest(self) -> SearchSpaceDigest:
+        if self._search_space_digest is None:
+            raise RuntimeError(
+                "`search_space_digest` is not initialized. Must `fit` the model first."
+            )
+        return self._search_space_digest
+
+    @search_space_digest.setter
+    def search_space_digest(self, value: SearchSpaceDigest) -> None:
+        raise RuntimeError("Setting search_space_digest manually is disallowed.")

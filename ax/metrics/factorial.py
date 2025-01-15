@@ -4,15 +4,18 @@
 # This source code is licensed under the MIT license found in the
 # LICENSE file in the root directory of this source tree.
 
-from typing import Any, Dict, Tuple
+# pyre-strict
+
+from typing import Any
 
 import numpy as np
 import pandas as pd
 from ax.core.base_trial import BaseTrial
 from ax.core.batch_trial import BatchTrial
 from ax.core.data import Data
-from ax.core.metric import Metric
+from ax.core.metric import Metric, MetricFetchE, MetricFetchResult
 from ax.core.types import TParameterization, TParamValue
+from ax.utils.common.result import Err, Ok
 from ax.utils.stats.statstools import agresti_coull_sem
 
 
@@ -24,7 +27,7 @@ class FactorialMetric(Metric):
     def __init__(
         self,
         name: str,
-        coefficients: Dict[str, Dict[TParamValue, float]],
+        coefficients: dict[str, dict[TParamValue, float]],
         batch_size: int = 10000,
         noise_var: float = 0.0,
     ) -> None:
@@ -38,7 +41,7 @@ class FactorialMetric(Metric):
             noise_var: used in calculating the probability of
                 each arm.
         """
-        super(FactorialMetric, self).__init__(name)
+        super().__init__(name)
 
         self.coefficients = coefficients
         self.batch_size = batch_size
@@ -51,45 +54,53 @@ class FactorialMetric(Metric):
         # fabricated from parameterizations.
         return True
 
-    def fetch_trial_data(self, trial: BaseTrial, **kwargs: Any) -> Data:
-        if not isinstance(trial, BatchTrial):
-            raise ValueError("Factorial metric can only fetch data for batch trials.")
-        if not trial.status.expecting_data:
-            raise ValueError("Can only fetch data if trial is expecting data.")
+    def fetch_trial_data(self, trial: BaseTrial, **kwargs: Any) -> MetricFetchResult:
+        try:
+            if not isinstance(trial, BatchTrial):
+                raise ValueError(
+                    "Factorial metric can only fetch data for batch trials."
+                )
+            if not trial.status.expecting_data:
+                raise ValueError("Can only fetch data if trial is expecting data.")
 
-        data = []
-        normalized_arm_weights = trial.normalized_arm_weights()
-        for name, arm in trial.arms_by_name.items():
-            weight = normalized_arm_weights[arm]
-            mean, sem = evaluation_function(
-                parameterization=arm.parameters,
-                weight=weight,
-                coefficients=self.coefficients,
-                batch_size=self.batch_size,
-                noise_var=self.noise_var,
+            data = []
+            normalized_arm_weights = trial.normalized_arm_weights()
+            for name, arm in trial.arms_by_name.items():
+                weight = normalized_arm_weights[arm]
+                mean, sem = evaluation_function(
+                    parameterization=arm.parameters,
+                    weight=weight,
+                    coefficients=self.coefficients,
+                    batch_size=self.batch_size,
+                    noise_var=self.noise_var,
+                )
+                n = np.random.binomial(self.batch_size, weight)
+                data.append(
+                    {
+                        "arm_name": name,
+                        "metric_name": self.name,
+                        "mean": mean,
+                        "sem": sem,
+                        "trial_index": trial.index,
+                        "n": n,
+                        "frac_nonnull": mean,
+                    }
+                )
+            return Ok(value=Data(df=pd.DataFrame(data)))
+
+        except Exception as e:
+            return Err(
+                MetricFetchE(message=f"Failed to fetch {self.name}", exception=e)
             )
-            n = np.random.binomial(self.batch_size, weight)
-            data.append(
-                {
-                    "arm_name": name,
-                    "metric_name": self.name,
-                    "mean": mean,
-                    "sem": sem,
-                    "trial_index": trial.index,
-                    "n": n,
-                    "frac_nonnull": mean,
-                }
-            )
-        return Data(df=pd.DataFrame(data))
 
 
 def evaluation_function(
     parameterization: TParameterization,
-    coefficients: Dict[str, Dict[TParamValue, float]],
+    coefficients: dict[str, dict[TParamValue, float]],
     weight: float = 1.0,
     batch_size: int = 10000,
     noise_var: float = 0.0,
-) -> Tuple[float, float]:
+) -> tuple[float, float]:
     probability = _parameterization_probability(
         parameterization=parameterization,
         coefficients=coefficients,
@@ -105,15 +116,15 @@ def evaluation_function(
 
 def _parameterization_probability(
     parameterization: TParameterization,
-    coefficients: Dict[str, Dict[TParamValue, float]],
+    coefficients: dict[str, dict[TParamValue, float]],
     noise_var: float = 0.0,
 ) -> float:
     z = 0.0
     for factor, level in parameterization.items():
         if factor not in coefficients.keys():
-            raise ValueError("{} not in supplied coefficients".format(factor))
+            raise ValueError(f"{factor} not in supplied coefficients")
         if level not in coefficients[factor].keys():
-            raise ValueError("{} not a valid level of {}".format(level, factor))
+            raise ValueError(f"{level} not a valid level of {factor}")
         z += coefficients[factor][level]
     z += np.sqrt(noise_var) * np.random.randn()
     return np.exp(z) / (1 + np.exp(z))

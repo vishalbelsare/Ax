@@ -4,11 +4,14 @@
 # This source code is licensed under the MIT license found in the
 # LICENSE file in the root directory of this source tree.
 
+# pyre-strict
+
 from __future__ import annotations
 
-from contextlib import contextmanager, nullcontext
-from os import remove as remove_file
-from typing import Any, Callable, ContextManager, Generator, Optional, TypeVar
+from collections.abc import Callable, Generator
+
+from contextlib import contextmanager
+from typing import Any, TypeVar
 
 from sqlalchemy import create_engine
 from sqlalchemy.engine.base import Engine
@@ -27,11 +30,11 @@ JSON_FIELD_LENGTH: int = 4096
 # Text(MEDIUMTEXT_BYTES) or Text(LONGTEXT_BYTES). This is preferable to
 # using MEDIUMTEXT and LONGTEXT directly because those are incompatible with
 # SQLite that is used in unit tests.
-MEDIUMTEXT_BYTES: int = 2 ** 24 - 1
-LONGTEXT_BYTES: int = 2 ** 32 - 1
+MEDIUMTEXT_BYTES: int = 2**24 - 1
+LONGTEXT_BYTES: int = 2**32 - 1
 
 # global database variables
-SESSION_FACTORY: Optional[Session] = None
+SESSION_FACTORY: Session | None = None
 
 # set this to false to prevent SQLAlchemy for automatically expiring objects
 # on commit, which essentially makes them unusable outside of a session
@@ -44,6 +47,8 @@ T = TypeVar("T")
 class SQABase:
     """Metaclass for SQLAlchemy classes corresponding to core Ax classes."""
 
+    __allow_unmapped__ = True
+    __table_args__ = {"extend_existing": True}
     pass
 
 
@@ -51,7 +56,10 @@ Base = declarative_base(cls=SQABase)
 
 
 def create_mysql_engine_from_creator(
-    creator: Callable, echo: bool = False, pool_recycle: int = 10, **kwargs: Any
+    creator: Callable,
+    echo: bool = False,
+    pool_recycle: int = 10,
+    **kwargs: Any,
 ) -> Engine:
     """Create a SQLAlchemy engine with the MySQL dialect given a creator function.
 
@@ -92,7 +100,7 @@ def create_mysql_engine_from_url(
     return create_engine(url, pool_recycle=pool_recycle, echo=echo, **kwargs)
 
 
-def create_test_engine(path: Optional[str] = None, echo: bool = True) -> Engine:
+def create_test_engine(path: str | None = None, echo: bool = True) -> Engine:
     """Creates a SQLAlchemy engine object for use in unit tests.
 
     Args:
@@ -111,13 +119,13 @@ def create_test_engine(path: Optional[str] = None, echo: bool = True) -> Engine:
         # (https://docs.sqlalchemy.org/en/14/core/engines.html#sqlite)
         db_path = "sqlite://"
     else:
-        db_path = "sqlite:///{path}".format(path=path)
+        db_path = f"sqlite:///{path}"
     return create_engine(db_path, echo=echo)
 
 
 def init_engine_and_session_factory(
-    url: Optional[str] = None,
-    creator: Optional[Callable] = None,
+    url: str | None = None,
+    creator: Callable | None = None,
     echo: bool = False,
     force_init: bool = False,
     **kwargs: Any,
@@ -148,20 +156,20 @@ def init_engine_and_session_factory(
         if force_init:
             SESSION_FACTORY.bind.dispose()
         else:
-            return  # pragma: no cover
+            return
     if url is not None:
         engine = create_mysql_engine_from_url(url=url, echo=echo, **kwargs)
     elif creator is not None:
         engine = create_mysql_engine_from_creator(creator=creator, echo=echo, **kwargs)
     else:
-        raise ValueError("Must specify either `url` or `creator`.")  # pragma: no cover
+        raise ValueError("Must specify either `url` or `creator`.")
     SESSION_FACTORY = scoped_session(
         sessionmaker(bind=engine, expire_on_commit=EXPIRE_ON_COMMIT)
     )
 
 
 def init_test_engine_and_session_factory(
-    tier_or_path: Optional[str] = None,
+    tier_or_path: str | None = None,
     echo: bool = False,
     force_init: bool = False,
     **kwargs: Any,
@@ -197,11 +205,6 @@ def init_test_engine_and_session_factory(
     )
 
 
-def remove_test_db_file(tier_or_path: str) -> None:
-    """Remove the test DB file from system, useful for cleanup in tests."""
-    remove_file(tier_or_path)
-
-
 def create_all_tables(engine: Engine) -> None:
     """Create all tables that inherit from Base.
 
@@ -214,20 +217,16 @@ def create_all_tables(engine: Engine) -> None:
         define a mapped class that inherits from `Base` must be imported.
 
     """
-    if (
-        engine.dialect.name == "mysql"
-        and engine.dialect.default_schema_name == "adaptive_experiment"
-    ):
-        raise Exception("Cannot mutate tables in XDB. Use AOSC.")  # pragma: no cover
+    if engine.dialect.name == "mysql" and engine.dialect.default_schema_name == "ax":
+        raise ValueError(
+            "The open-source Ax table creation is likely not applicable in this case,"
+            + "please contact the Adaptive Experimentation team if you need help."
+        )
     Base.metadata.create_all(engine)
 
 
 def get_session() -> Session:
     """Fetch a SQLAlchemy session with a connection to a DB.
-
-    Unless `init_engine_and_session_factory` is called first with custom
-    args, this will automatically initialize a connection to
-    `xdb.adaptive_experiment`.
 
     Returns:
         Session: an instance of a SQLAlchemy session.
@@ -235,7 +234,7 @@ def get_session() -> Session:
     """
     global SESSION_FACTORY
     if SESSION_FACTORY is None:
-        init_engine_and_session_factory()  # pragma: no cover
+        init_engine_and_session_factory()
     assert SESSION_FACTORY is not None
     # pyre-fixme[29]: `Session` is not a function.
     return SESSION_FACTORY()
@@ -253,7 +252,7 @@ def get_engine() -> Engine:
     """
     global SESSION_FACTORY
     if SESSION_FACTORY is None:
-        raise ValueError("Engine must be initialized first.")  # pragma: no cover
+        raise ValueError("Engine must be initialized first.")
     return SESSION_FACTORY.bind
 
 
@@ -264,16 +263,8 @@ def session_scope() -> Generator[Session, None, None]:
     try:
         yield session
         session.commit()
-    except Exception:  # pragma: no cover
-        session.rollback()  # pragma: no cover
-        raise  # pragma: no cover
+    except Exception:
+        session.rollback()
+        raise
     finally:
         session.close()
-
-
-def optional_session_scope(
-    session: Optional[Session] = None,
-) -> ContextManager[Session]:
-    if session is not None:
-        return nullcontext(session)
-    return session_scope()

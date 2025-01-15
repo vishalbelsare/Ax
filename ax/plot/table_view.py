@@ -4,6 +4,8 @@
 # This source code is licensed under the MIT license found in the
 # LICENSE file in the root directory of this source tree.
 
+# pyre-strict
+
 import math
 
 import pandas as pd
@@ -14,6 +16,7 @@ from ax.modelbridge.factory import get_empirical_bayes_thompson, get_thompson
 from ax.plot.base import AxPlotConfig, AxPlotTypes, PlotMetric, Z
 from ax.plot.helper import get_plot_data
 from ax.plot.scatter import _error_scatter_data
+from pandas.core.frame import DataFrame
 
 
 COLOR_SCALE = ["#ff3333", "#ff6666", "#ffffff", "#99ff99", "#33ff33"]
@@ -40,7 +43,7 @@ def table_view_plot(
     use_empirical_bayes: bool = True,
     only_data_frame: bool = False,
     arm_noun: str = "arm",
-):
+) -> tuple[DataFrame]:
     """Table of means and confidence intervals.
 
     Table is of the form:
@@ -119,10 +122,7 @@ def table_view_plot(
             ]
         )
         records.append(
-            [
-                "{:.3f} &plusmn; {:.3f}".format(y, Z * y_se)
-                for (_, y, y_se) in results_by_arm
-            ]
+            [f"{y:.3f} &plusmn; {Z * y_se:.3f}" for (_, y, y_se) in results_by_arm]
         )
         records_with_mean.append({arm_name: y for (arm_name, y, _) in results_by_arm})
         records_with_ci.append(
@@ -135,13 +135,13 @@ def table_view_plot(
             for records in [records_with_mean, records_with_ci]
         )
 
+    # pyre-fixme[3]: Return type must be annotated.
+    # pyre-fixme[2]: Parameter must be annotated.
     def transpose(m):
         return [[m[j][i] for j in range(len(m))] for i in range(len(m[0]))]
 
     records = [[name.replace(":", " : ") for name in metric_names]] + transpose(records)
     colors = [["#ffffff"] * len(metric_names)] + transpose(colors)
-    # pyre-fixme[58]: `+` is not supported for operand types `List[str]` and
-    #  `List[float]`.
     # pyre-fixme[61]: `arm_names` may not be initialized here.
     header = [f"<b>{x}</b>" for x in [f"{arm_noun}s"] + arm_names]
     # pyre-fixme[61]: `arm_names` may not be initialized here.
@@ -157,4 +157,6 @@ def table_view_plot(
         margin=go.layout.Margin(l=0, r=20, b=20, t=20, pad=4),  # noqa E741
     )
     fig = go.Figure(data=[trace], layout=layout)
+    # pyre-fixme[7]: Expected `Tuple[DataFrame]` but got `AxPlotConfig`.
+    # pyre-fixme[6]: For 1st argument expected `Dict[str, typing.Any]` but got `Figure`.
     return AxPlotConfig(data=fig, plot_type=AxPlotTypes.GENERIC)

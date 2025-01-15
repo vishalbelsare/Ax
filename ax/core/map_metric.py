@@ -4,12 +4,15 @@
 # This source code is licensed under the MIT license found in the
 # LICENSE file in the root directory of this source tree.
 
+# pyre-strict
+
 from __future__ import annotations
 
-from typing import Type
+from ax.core.map_data import MapData, MapKeyInfo
+from ax.core.metric import Metric, MetricFetchE
+from ax.utils.common.result import Result
 
-from ax.core.map_data import MapData
-from ax.core.metric import Metric
+MapMetricFetchResult = Result[MapData, MetricFetchE]
 
 
 class MapMetric(Metric):
@@ -26,4 +29,5 @@ class MapMetric(Metric):
         properties: Properties specific to a particular metric.
     """
 
-    data_constructor: Type[MapData] = MapData
+    data_constructor: type[MapData] = MapData
+    map_key_info: MapKeyInfo[float] = MapKeyInfo(key="step", default_value=0.0)

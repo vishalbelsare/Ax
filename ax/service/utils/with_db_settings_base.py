@@ -4,39 +4,73 @@
 # This source code is licensed under the MIT license found in the
 # LICENSE file in the root directory of this source tree.
 
+# pyre-strict
+
+import re
 import time
-from logging import INFO
-from typing import List, Optional, Tuple, Type
+from collections.abc import Iterable
+
+from logging import INFO, Logger
+from typing import Optional, Sequence
+
+from ax.analysis.analysis import AnalysisCard
 
 from ax.core.base_trial import BaseTrial
 from ax.core.experiment import Experiment
+from ax.core.generation_strategy_interface import GenerationStrategyInterface
 from ax.core.generator_run import GeneratorRun
-from ax.exceptions.core import ObjectNotFoundError
-from ax.exceptions.core import UnsupportedError
+from ax.core.runner import Runner
+from ax.exceptions.core import (
+    IncompatibleDependencyVersion,
+    ObjectNotFoundError,
+    UnsupportedError,
+)
 from ax.modelbridge.generation_strategy import GenerationStrategy
 from ax.utils.common.executils import retry_on_exception
 from ax.utils.common.logger import _round_floats_for_logging, get_logger
-from ax.utils.common.typeutils import not_none
+from pyre_extensions import none_throws
+
+RETRY_EXCEPTION_TYPES: tuple[type[Exception], ...] = ()
 
 
-RETRY_EXCEPTION_TYPES: Tuple[Type[Exception], ...] = ()
+logger: Logger = get_logger(__name__)
 
 try:  # We don't require SQLAlchemy by default.
+    # pyre-fixme[21]: Could not find a name `__version__` defined in module
+    # `sqlalchemy`.
+    from sqlalchemy import __version__ as sqa_version
+
+    # pyre-fixme[16]: Module `sqlalchemy` has no attribute `__version__`.
+    sqa_major_version = int(none_throws(re.match(r"^\d*", sqa_version))[0])
+    if sqa_major_version > 1:
+        msg = (
+            "Ax currently requires a sqlalchemy version below 2.0. This will be "
+            "addressed in a future release. Disabling SQL storage in Ax for now, if "
+            "you would like to use SQL storage please install Ax with mysql extras "
+            "via `pip install ax-platform[mysql]`."
+        )
+
+        logger.warning(msg)
+
+        raise IncompatibleDependencyVersion(msg)
+
     from ax.storage.sqa_store.db import init_engine_and_session_factory
     from ax.storage.sqa_store.decoder import Decoder
     from ax.storage.sqa_store.encoder import Encoder
     from ax.storage.sqa_store.load import (
         _get_experiment_id,
-        _get_generation_strategy_id,
         _load_experiment,
         _load_generation_strategy_by_experiment_name,
+        get_generation_strategy_id,
     )
     from ax.storage.sqa_store.save import (
-        _save_or_update_trials,
         _save_experiment,
         _save_generation_strategy,
+        _save_or_update_trials,
         _update_generation_strategy,
+        save_analysis_cards,
         update_properties_on_experiment,
+        update_runner_on_experiment,
     )
     from ax.storage.sqa_store.sqa_config import SQAConfig
     from ax.storage.sqa_store.structs import DBSettings
@@ -45,7 +79,7 @@ try:  # We don't require SQLAlchemy by default.
 
     # We retry on `OperationalError` if saving to DB.
     RETRY_EXCEPTION_TYPES = (OperationalError, StaleDataError)
-except ModuleNotFoundError:  # pragma: no cover
+except (ModuleNotFoundError, IncompatibleDependencyVersion, TypeError):
     DBSettings = None
     Decoder = None
     Encoder = None
@@ -54,8 +88,6 @@ except ModuleNotFoundError:  # pragma: no cover
 
 STORAGE_MINI_BATCH_SIZE = 50
 LOADING_MINI_BATCH_SIZE = 10000
-
-logger = get_logger(__name__)
 
 
 class WithDBSettingsBase:
@@ -103,11 +135,11 @@ class WithDBSettingsBase:
         """DB settings set on this instance; guaranteed to be non-None."""
         if self._db_settings is None:
             raise ValueError("No DB settings are set on this instance.")
-        return not_none(self._db_settings)
+        return none_throws(self._db_settings)
 
     def _get_experiment_and_generation_strategy_db_id(
         self, experiment_name: str
-    ) -> Tuple[Optional[int], Optional[int]]:
+    ) -> tuple[int | None, int | None]:
         """Retrieve DB ids of experiment by the given name and the associated
         generation strategy. Each ID is None if corresponding object is not
         found.
@@ -120,14 +152,14 @@ class WithDBSettingsBase:
         )
         if not exp_id:
             return None, None
-        gs_id = _get_generation_strategy_id(
+        gs_id = get_generation_strategy_id(
             experiment_name=experiment_name, decoder=self.db_settings.decoder
         )
         return exp_id, gs_id
 
     def _maybe_save_experiment_and_generation_strategy(
-        self, experiment: Experiment, generation_strategy: GenerationStrategy
-    ) -> Tuple[bool, bool]:
+        self, experiment: Experiment, generation_strategy: GenerationStrategyInterface
+    ) -> tuple[bool, bool]:
         """If DB settings are set on this `WithDBSettingsBase` instance, checks
         whether given experiment and generation strategy are already saved and
         saves them, if not.
@@ -143,7 +175,7 @@ class WithDBSettingsBase:
                 raise ValueError(
                     "Experiment must specify a name to use storage functionality."
                 )
-            exp_name = not_none(experiment.name)
+            exp_name = none_throws(experiment.name)
             exp_id, gs_id = self._get_experiment_and_generation_strategy_db_id(
                 experiment_name=exp_name
             )
@@ -185,7 +217,8 @@ class WithDBSettingsBase:
         self,
         experiment_name: str,
         reduced_state: bool = False,
-    ) -> Tuple[Optional[Experiment], Optional[GenerationStrategy]]:
+        skip_runners_and_metrics: bool = False,
+    ) -> tuple[Experiment | None, GenerationStrategy | None]:
         """Loads experiment and its corresponding generation strategy from database
         if DB settings are set on this `WithDBSettingsBase` instance.
 
@@ -219,34 +252,21 @@ class WithDBSettingsBase:
             decoder=self.db_settings.decoder,
             reduced_state=reduced_state,
             load_trials_in_batches_of_size=LOADING_MINI_BATCH_SIZE,
+            skip_runners_and_metrics=skip_runners_and_metrics,
         )
         if not isinstance(experiment, Experiment):
             raise ValueError("Service API only supports `Experiment`.")
+        num_trials = len(experiment.trials)
         logger.info(
-            f"Loaded experiment {experiment_name} in "
-            f"{_round_floats_for_logging(time.time() - start_time)} seconds, "
-            f"loading trials in mini-batches of {LOADING_MINI_BATCH_SIZE}."
+            f"Loaded experiment {experiment_name} & {num_trials} trials in "
+            f"{_round_floats_for_logging(time.time() - start_time)} seconds."
         )
-
-        try:
-            start_time = time.time()
-            generation_strategy = _load_generation_strategy_by_experiment_name(
-                experiment_name=experiment_name,
-                decoder=self.db_settings.decoder,
-                experiment=experiment,
-                reduced_state=reduced_state,
-            )
-            logger.info(
-                f"Loaded generation strategy for experiment {experiment_name} in "
-                f"{_round_floats_for_logging(time.time() - start_time)} seconds."
-            )
-        except ObjectNotFoundError:
-            logger.info(
-                "There is no generation strategy associated with experiment "
-                f"{experiment_name}."
-            )
-
-            return experiment, None
+        generation_strategy = try_load_generation_strategy(
+            experiment_name=experiment_name,
+            decoder=self.db_settings.decoder,
+            experiment=experiment,
+            reduced_state=reduced_state,
+        )
 
         return experiment, generation_strategy
 
@@ -273,9 +293,9 @@ class WithDBSettingsBase:
     def _save_or_update_trials_and_generation_strategy_if_possible(
         self,
         experiment: Experiment,
-        trials: List[BaseTrial],
-        generation_strategy: GenerationStrategy,
-        new_generator_runs: List[GeneratorRun],
+        trials: list[BaseTrial],
+        generation_strategy: GenerationStrategyInterface,
+        new_generator_runs: list[GeneratorRun],
         reduce_state_generator_runs: bool = False,
     ) -> None:
         """Saves new trials (and updates existing ones) on given experiment
@@ -329,7 +349,7 @@ class WithDBSettingsBase:
     def _save_or_update_trials_in_db_if_possible(
         self,
         experiment: Experiment,
-        trials: List[BaseTrial],
+        trials: Sequence[BaseTrial],
         reduce_state_generator_runs: bool = False,
     ) -> bool:
         """Saves new trials or update existing trials on given experiment if DB
@@ -356,40 +376,48 @@ class WithDBSettingsBase:
 
     def _save_generation_strategy_to_db_if_possible(
         self,
-        generation_strategy: Optional[GenerationStrategy] = None,
-        suppress_all_errors: bool = False,
+        generation_strategy: GenerationStrategyInterface | None = None,
     ) -> bool:
         """Saves given generation strategy if DB settings are set on this
-        `WithDBSettingsBase` instance.
+        `WithDBSettingsBase` instance and the generation strategy is an
+        instance of `GenerationStrategy`.
 
         Args:
-            generation_strategy: Generation strategy to save in DB.
+            generation_strategy: GenerationStrategyInterface to update in DB.
+                For now, only instances of  GenerationStrategy will be updated.
+                Otherwise, this function is a no-op.
 
         Returns:
             bool: Whether the generation strategy was saved.
         """
         if self.db_settings_set and generation_strategy is not None:
-            _save_generation_strategy_to_db_if_possible(
-                generation_strategy=generation_strategy,
-                encoder=self.db_settings.encoder,
-                decoder=self.db_settings.decoder,
-                suppress_all_errors=self._suppress_all_errors,
-            )
-            return True
+            # only local GenerationStrategies should need to be saved to
+            # the database because only they make changes locally
+            if isinstance(generation_strategy, GenerationStrategy):
+                _save_generation_strategy_to_db_if_possible(
+                    generation_strategy=generation_strategy,
+                    encoder=self.db_settings.encoder,
+                    decoder=self.db_settings.decoder,
+                    suppress_all_errors=self._suppress_all_errors,
+                )
+                return True
         return False
 
     def _update_generation_strategy_in_db_if_possible(
         self,
-        generation_strategy: GenerationStrategy,
-        new_generator_runs: List[GeneratorRun],
+        generation_strategy: GenerationStrategyInterface,
+        new_generator_runs: list[GeneratorRun],
         reduce_state_generator_runs: bool = False,
     ) -> bool:
         """Updates the given generation strategy with new generator runs (and with
         new current generation step if applicable) if DB settings are set
-        on this `WithDBSettingsBase` instance.
+        on this `WithDBSettingsBase` instance and the generation strategy is an
+        instance of `GenerationStrategy`.
 
         Args:
-            generation_strategy: Generation strategy to update in DB.
+            generation_strategy: GenerationStrategyInterface to update in DB.
+                For now, only instances of  GenerationStrategy will be updated.
+                Otherwise, this function is a no-op.
             new_generator_runs: New generator runs of this generation strategy
                 since its last save.
 
@@ -397,15 +425,33 @@ class WithDBSettingsBase:
             bool: Whether the experiment was saved.
         """
         if self.db_settings_set:
-            _update_generation_strategy_in_db_if_possible(
-                generation_strategy=generation_strategy,
-                new_generator_runs=new_generator_runs,
+            # only local GenerationStrategies should need to be saved to
+            # the database because only they make changes locally
+            if isinstance(generation_strategy, GenerationStrategy):
+                _update_generation_strategy_in_db_if_possible(
+                    generation_strategy=generation_strategy,
+                    new_generator_runs=new_generator_runs,
+                    encoder=self.db_settings.encoder,
+                    decoder=self.db_settings.decoder,
+                    suppress_all_errors=self._suppress_all_errors,
+                    reduce_state_generator_runs=reduce_state_generator_runs,
+                )
+                return True
+        return False
+
+    def _update_runner_on_experiment_in_db_if_possible(
+        self, experiment: Experiment, runner: Runner
+    ) -> bool:
+        if self.db_settings_set:
+            _update_runner_on_experiment_in_db_if_possible(
+                experiment=experiment,
+                runner=runner,
                 encoder=self.db_settings.encoder,
                 decoder=self.db_settings.decoder,
                 suppress_all_errors=self._suppress_all_errors,
-                reduce_state_generator_runs=reduce_state_generator_runs,
             )
             return True
+
         return False
 
     def _update_experiment_properties_in_db(
@@ -422,6 +468,22 @@ class WithDBSettingsBase:
             return True
         return False
 
+    def _save_analysis_cards_to_db_if_possible(
+        self,
+        experiment: Experiment,
+        analysis_cards: Iterable[AnalysisCard],
+    ) -> bool:
+        if self.db_settings_set:
+            _save_analysis_cards_to_db_if_possible(
+                experiment=experiment,
+                analysis_cards=analysis_cards,
+                sqa_config=self.db_settings.encoder.config,
+                suppress_all_errors=self._suppress_all_errors,
+            )
+            return True
+
+        return False
+
 
 # ------------- Utils for storage that assume `DBSettings` are provided --------
 
@@ -435,7 +497,7 @@ def _save_experiment_to_db_if_possible(
     experiment: Experiment,
     encoder: Encoder,
     decoder: Decoder,
-    suppress_all_errors: bool,
+    suppress_all_errors: bool,  # Used by the decorator.
 ) -> None:
     start_time = time.time()
     _save_experiment(
@@ -456,10 +518,10 @@ def _save_experiment_to_db_if_possible(
 )
 def _save_or_update_trials_in_db_if_possible(
     experiment: Experiment,
-    trials: List[BaseTrial],
+    trials: list[BaseTrial],
     encoder: Encoder,
     decoder: Decoder,
-    suppress_all_errors: bool,
+    suppress_all_errors: bool,  # Used by the decorator.
     reduce_state_generator_runs: bool = False,
 ) -> None:
     start_time = time.time()
@@ -487,7 +549,7 @@ def _save_generation_strategy_to_db_if_possible(
     generation_strategy: GenerationStrategy,
     encoder: Encoder,
     decoder: Decoder,
-    suppress_all_errors: bool,
+    suppress_all_errors: bool,  # Used by the decorator.
 ) -> None:
     start_time = time.time()
     _save_generation_strategy(
@@ -508,10 +570,10 @@ def _save_generation_strategy_to_db_if_possible(
 )
 def _update_generation_strategy_in_db_if_possible(
     generation_strategy: GenerationStrategy,
-    new_generator_runs: List[GeneratorRun],
+    new_generator_runs: list[GeneratorRun],
     encoder: Encoder,
     decoder: Decoder,
-    suppress_all_errors: bool,
+    suppress_all_errors: bool,  # Used by the decorator.
     reduce_state_generator_runs: bool = False,
 ) -> None:
     start_time = time.time()
@@ -535,12 +597,75 @@ def _update_generation_strategy_in_db_if_possible(
     default_return_on_suppression=False,
     exception_types=RETRY_EXCEPTION_TYPES,
 )
+def _update_runner_on_experiment_in_db_if_possible(
+    experiment: Experiment,
+    runner: Runner,
+    encoder: Encoder,
+    decoder: Decoder,
+    suppress_all_errors: bool,  # Used by the decorator.
+) -> None:
+    update_runner_on_experiment(
+        experiment=experiment, runner=runner, encoder=encoder, decoder=decoder
+    )
+
+
+@retry_on_exception(
+    retries=3,
+    default_return_on_suppression=False,
+    exception_types=RETRY_EXCEPTION_TYPES,
+)
 def _update_experiment_properties_in_db(
     experiment_with_updated_properties: Experiment,
     sqa_config: SQAConfig,
-    suppress_all_errors: bool,
+    suppress_all_errors: bool,  # Used by the decorator.
 ) -> None:
     update_properties_on_experiment(
         experiment_with_updated_properties=experiment_with_updated_properties,
         config=sqa_config,
     )
+
+
+@retry_on_exception(
+    retries=3,
+    default_return_on_suppression=False,
+    exception_types=RETRY_EXCEPTION_TYPES,
+)
+def _save_analysis_cards_to_db_if_possible(
+    experiment: Experiment,
+    analysis_cards: Iterable[AnalysisCard],
+    sqa_config: SQAConfig,
+    suppress_all_errors: bool,  # Used by the decorator.
+) -> None:
+    save_analysis_cards(
+        experiment=experiment,
+        analysis_cards=[*analysis_cards],
+        config=sqa_config,
+    )
+
+
+def try_load_generation_strategy(
+    experiment_name: str,
+    decoder: Decoder,
+    experiment: Experiment | None = None,
+    reduced_state: bool = False,
+) -> GenerationStrategy | None:
+    """Load generation strategy by experiment name, if it exists."""
+    try:
+        start_time = time.time()
+        generation_strategy = _load_generation_strategy_by_experiment_name(
+            experiment_name=experiment_name,
+            decoder=decoder,
+            experiment=experiment,
+            reduced_state=reduced_state,
+        )
+        logger.info(
+            f"Loaded generation strategy for experiment {experiment_name} in "
+            f"{_round_floats_for_logging(time.time() - start_time)} seconds."
+        )
+    except ObjectNotFoundError:
+        logger.info(
+            "There is no generation strategy associated with experiment "
+            f"{experiment_name}."
+        )
+        return None
+    return generation_strategy

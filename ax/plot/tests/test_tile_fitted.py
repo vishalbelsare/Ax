@@ -4,7 +4,8 @@
 # This source code is licensed under the MIT license found in the
 # LICENSE file in the root directory of this source tree.
 
-from typing import Optional
+# pyre-strict
+
 from unittest import mock
 
 from ax.core.arm import Arm
@@ -32,7 +33,11 @@ from ax.utils.testing.modeling_stubs import get_observation
     "ax.modelbridge.base.gen_arms", autospec=True, return_value=[Arm(parameters={})]
 )
 def get_modelbridge(
-    mock_gen_arms, mock_observations_from_data, status_quo_name: Optional[str] = None
+    # pyre-fixme[2]: Parameter must be annotated.
+    mock_gen_arms,
+    # pyre-fixme[2]: Parameter must be annotated.
+    mock_observations_from_data,
+    status_quo_name: str | None = None,
 ) -> ModelBridge:
     exp = get_experiment()
     modelbridge = ModelBridge(
@@ -51,7 +56,7 @@ def get_modelbridge(
 
 
 class TileFittedTest(TestCase):
-    def testTileFitted(self):
+    def test_TileFitted(self) -> None:
         model = get_modelbridge(status_quo_name=None)
 
         # Should throw if `status_quo_arm` is None and rel=True
@@ -111,11 +116,13 @@ class TileFittedTest(TestCase):
 
 
 class TileObservationsTest(TestCase):
-    def testTileObservations(self):
+    def test_TileObservations(self) -> None:
         exp = get_experiment_with_data()
         exp.trials[0].run()
         exp.trials[0].mark_completed()
         exp.add_tracking_metric(Metric("ax_test_metric"))
+        # pyre-fixme[6]: For 1st param expected `List[Parameter]` but got
+        #  `dict_values[str, Parameter]`.
         exp.search_space = SearchSpace(parameters=exp.search_space.parameters.values())
         config = tile_observations(experiment=exp, arm_names=["0_1", "0_2"], rel=False)
 
@@ -135,8 +142,18 @@ class TileObservationsTest(TestCase):
         ]:
             self.assertIn(key, config.data["layout"])
 
+        self.assertEqual(
+            config.data["layout"]["annotations"][0]["text"], "ax_test_metric"
+        )
+
         # Data
         self.assertEqual(config.data["data"][0]["x"], ["0_1", "0_2"])
         self.assertEqual(config.data["data"][0]["y"], [2.0, 2.25])
         self.assertEqual(config.data["data"][0]["type"], "scatter")
         self.assertIn("Arm 0_1", config.data["data"][0]["text"][0])
+
+        label_dict = {"ax_test_metric": "mapped_name"}
+        config = tile_observations(
+            experiment=exp, arm_names=["0_1", "0_2"], rel=False, label_dict=label_dict
+        )
+        self.assertEqual(config.data["layout"]["annotations"][0]["text"], "mapped_name")

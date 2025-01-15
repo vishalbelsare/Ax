@@ -4,15 +4,18 @@
 # This source code is licensed under the MIT license found in the
 # LICENSE file in the root directory of this source tree.
 
-from typing import Any, Callable, Dict, List, Optional, Tuple
+# pyre-strict
+
+from collections.abc import Callable
+from logging import Logger
+from typing import Any, Optional
 
 import torch
-from ax.core.types import TCandidateMetadata, TGenMetadata
+from ax.core.search_space import SearchSpaceDigest
 from ax.exceptions.core import AxError
 from ax.models.torch.botorch import (
     BotorchModel,
     get_rounding_func,
-    TAcqfConstructor,
     TBestPointRecommender,
     TModelConstructor,
     TModelPredictor,
@@ -20,46 +23,48 @@ from ax.models.torch.botorch import (
 )
 from ax.models.torch.botorch_defaults import (
     get_and_fit_model,
-    predict_from_model,
     recommend_best_observed_point,
     scipy_optimizer,
+    TAcqfConstructor,
 )
 from ax.models.torch.botorch_moo_defaults import (
-    get_NEHVI,
+    get_qLogNEHVI,
     infer_objective_thresholds,
     pareto_frontier_evaluator,
     scipy_optimizer_list,
+    TFrontierEvaluator,
 )
-from ax.models.torch.frontier_utils import TFrontierEvaluator
 from ax.models.torch.utils import (
     _get_X_pending_and_observed,
     _to_inequality_constraints,
+    predict_from_model,
     randomize_objective_weights,
     subset_model,
 )
-from ax.models.torch_base import TorchModel
-from ax.models.types import TConfig
+from ax.models.torch_base import TorchGenResults, TorchModel, TorchOptConfig
 from ax.utils.common.constants import Keys
 from ax.utils.common.docutils import copy_doc
 from ax.utils.common.logger import get_logger
-from ax.utils.common.typeutils import checked_cast, not_none
+from ax.utils.common.typeutils import checked_cast
 from botorch.acquisition.acquisition import AcquisitionFunction
 from botorch.models.model import Model
+from pyre_extensions import none_throws
 from torch import Tensor
 
 
-logger = get_logger(__name__)
+logger: Logger = get_logger(__name__)
 
+# pyre-fixme[33]: Aliased annotation cannot contain `Any`.
 TOptimizerList = Callable[
     [
-        List[AcquisitionFunction],
+        list[AcquisitionFunction],
         Tensor,
-        Optional[List[Tuple[Tensor, Tensor, float]]],
-        Optional[Dict[int, float]],
+        Optional[list[tuple[Tensor, Tensor, float]]],
+        Optional[dict[int, float]],
         Optional[Callable[[Tensor], Tensor]],
         Any,
     ],
-    Tuple[Tensor, Tensor],
+    tuple[Tensor, Tensor],
 ]
 
 
@@ -137,7 +142,7 @@ class MultiObjectiveBotorchModel(BotorchModel):
     the (linear) outcome constraints, `X_observed` are previously observed points,
     and `X_pending` are points whose evaluation is pending. `acq_function` is a
     BoTorch acquisition function crafted from these inputs. For additional
-    details on the arguments, see `get_NEI`.
+    details on the arguments, see `get_qLogNEHVI`.
 
     ::
 
@@ -177,11 +182,11 @@ class MultiObjectiveBotorchModel(BotorchModel):
     a tuple of tensors describing the (linear) outcome constraints.
     """
 
-    dtype: Optional[torch.dtype]
-    device: Optional[torch.device]
-    Xs: List[Tensor]
-    Ys: List[Tensor]
-    Yvars: List[Tensor]
+    dtype: torch.dtype | None
+    device: torch.device | None
+    Xs: list[Tensor]
+    Ys: list[Tensor]
+    Yvars: list[Tensor]
 
     def __init__(
         self,
@@ -192,7 +197,7 @@ class MultiObjectiveBotorchModel(BotorchModel):
         #  AcquisitionFunction]`; used as `Callable[[Model, Tensor,
         #  Optional[Tuple[Tensor, Tensor]], Optional[Tensor], Optional[Tensor],
         #  **(Any)], AcquisitionFunction]`.
-        acqf_constructor: TAcqfConstructor = get_NEHVI,
+        acqf_constructor: TAcqfConstructor = get_qLogNEHVI,
         # pyre-fixme[9]: acqf_optimizer has type `Callable[[AcquisitionFunction,
         #  Tensor, int, Optional[Dict[int, float]], Optional[Callable[[Tensor],
         #  Tensor]], Any], Tensor]`; used as `Callable[[AcquisitionFunction, Tensor,
@@ -203,10 +208,10 @@ class MultiObjectiveBotorchModel(BotorchModel):
         best_point_recommender: TBestPointRecommender = recommend_best_observed_point,
         frontier_evaluator: TFrontierEvaluator = pareto_frontier_evaluator,
         refit_on_cv: bool = False,
-        refit_on_update: bool = True,
         warm_start_refitting: bool = False,
         use_input_warping: bool = False,
         use_loocv_pseudo_likelihood: bool = False,
+        prior: dict[str, Any] | None = None,
         **kwargs: Any,
     ) -> None:
         self.model_constructor = model_constructor
@@ -215,48 +220,42 @@ class MultiObjectiveBotorchModel(BotorchModel):
         self.acqf_optimizer = acqf_optimizer
         self.best_point_recommender = best_point_recommender
         self.frontier_evaluator = frontier_evaluator
+        # pyre-fixme[4]: Attribute must be annotated.
         self._kwargs = kwargs
         self.refit_on_cv = refit_on_cv
-        self.refit_on_update = refit_on_update
         self.warm_start_refitting = warm_start_refitting
         self.use_input_warping = use_input_warping
         self.use_loocv_pseudo_likelihood = use_loocv_pseudo_likelihood
-        self.model: Optional[Model] = None
+        self.prior = prior
+        self.model: Model | None = None
         self.Xs = []
         self.Ys = []
         self.Yvars = []
         self.dtype = None
         self.device = None
-        self.task_features: List[int] = []
-        self.fidelity_features: List[int] = []
-        self.metric_names: List[str] = []
+        self.task_features: list[int] = []
+        self.fidelity_features: list[int] = []
+        self.metric_names: list[str] = []
 
     @copy_doc(TorchModel.gen)
     def gen(
         self,
         n: int,
-        bounds: List[Tuple[float, float]],
-        objective_weights: Tensor,  # objective_directions
-        outcome_constraints: Optional[Tuple[Tensor, Tensor]] = None,
-        objective_thresholds: Optional[Tensor] = None,
-        linear_constraints: Optional[Tuple[Tensor, Tensor]] = None,
-        fixed_features: Optional[Dict[int, float]] = None,
-        pending_observations: Optional[List[Tensor]] = None,
-        model_gen_options: Optional[TConfig] = None,
-        rounding_func: Optional[Callable[[Tensor], Tensor]] = None,
-        target_fidelities: Optional[Dict[int, float]] = None,
-    ) -> Tuple[Tensor, Tensor, TGenMetadata, Optional[List[TCandidateMetadata]]]:
-        options = model_gen_options or {}
+        search_space_digest: SearchSpaceDigest,
+        torch_opt_config: TorchOptConfig,
+    ) -> TorchGenResults:
+        options = torch_opt_config.model_gen_options or {}
         acf_options = options.get("acquisition_function_kwargs", {})
         optimizer_options = options.get("optimizer_kwargs", {})
 
-        if target_fidelities:
+        if search_space_digest.fidelity_features:  # untested
             raise NotImplementedError(
-                "target_fidelities not implemented for base BotorchModel"
+                "fidelity_features not implemented for base BotorchModel"
             )
         if (
-            objective_thresholds is not None
-            and objective_weights.shape[0] != objective_thresholds.shape[0]
+            torch_opt_config.objective_thresholds is not None
+            and torch_opt_config.objective_weights.shape[0]
+            != none_throws(torch_opt_config.objective_thresholds).shape[0]
         ):
             raise AxError(
                 "Objective weights and thresholds most both contain an element for"
@@ -265,25 +264,25 @@ class MultiObjectiveBotorchModel(BotorchModel):
 
         X_pending, X_observed = _get_X_pending_and_observed(
             Xs=self.Xs,
-            pending_observations=pending_observations,
-            objective_weights=objective_weights,
-            outcome_constraints=outcome_constraints,
-            bounds=bounds,
-            linear_constraints=linear_constraints,
-            fixed_features=fixed_features,
+            objective_weights=torch_opt_config.objective_weights,
+            bounds=search_space_digest.bounds,
+            pending_observations=torch_opt_config.pending_observations,
+            outcome_constraints=torch_opt_config.outcome_constraints,
+            linear_constraints=torch_opt_config.linear_constraints,
+            fixed_features=torch_opt_config.fixed_features,
         )
 
-        model = not_none(self.model)
-        full_objective_thresholds = objective_thresholds
-        full_objective_weights = objective_weights
-        full_outcome_constraints = outcome_constraints
+        model = none_throws(self.model)
+        full_objective_thresholds = torch_opt_config.objective_thresholds
+        full_objective_weights = torch_opt_config.objective_weights
+        full_outcome_constraints = torch_opt_config.outcome_constraints
         # subset model only to the outcomes we need for the optimization
         if options.get(Keys.SUBSET_MODEL, True):
             subset_model_results = subset_model(
                 model=model,
-                objective_weights=objective_weights,
-                outcome_constraints=outcome_constraints,
-                objective_thresholds=objective_thresholds,
+                objective_weights=torch_opt_config.objective_weights,
+                outcome_constraints=torch_opt_config.outcome_constraints,
+                objective_thresholds=torch_opt_config.objective_thresholds,
             )
             model = subset_model_results.model
             objective_weights = subset_model_results.objective_weights
@@ -291,36 +290,36 @@ class MultiObjectiveBotorchModel(BotorchModel):
             objective_thresholds = subset_model_results.objective_thresholds
             idcs = subset_model_results.indices
         else:
+            objective_weights = torch_opt_config.objective_weights
+            outcome_constraints = torch_opt_config.outcome_constraints
+            objective_thresholds = torch_opt_config.objective_thresholds
             idcs = None
-        if objective_thresholds is None:
-            full_objective_thresholds = infer_objective_thresholds(
-                model=model,
-                X_observed=not_none(X_observed),
-                objective_weights=full_objective_weights,
-                outcome_constraints=full_outcome_constraints,
-                subset_idcs=idcs,
-            )
-            # subset the objective thresholds
-            objective_thresholds = (
-                full_objective_thresholds
-                if idcs is None
-                else full_objective_thresholds[idcs].clone()
-            )
 
-        bounds_ = torch.tensor(bounds, dtype=self.dtype, device=self.device)
+        bounds_ = torch.tensor(
+            search_space_digest.bounds, dtype=self.dtype, device=self.device
+        )
         bounds_ = bounds_.transpose(0, 1)
-        botorch_rounding_func = get_rounding_func(rounding_func)
-        if acf_options.get("random_scalarization", False) or acf_options.get(
+        botorch_rounding_func = get_rounding_func(torch_opt_config.rounding_func)
+        if acf_options.pop("random_scalarization", False) or acf_options.get(
             "chebyshev_scalarization", False
         ):
             # If using a list of acquisition functions, the algorithm to generate
             # that list is configured by acquisition_function_kwargs.
+            if "random_scalarization_distribution" in acf_options:
+                randomize_weights_kws = {
+                    "random_scalarization_distribution": acf_options[
+                        "random_scalarization_distribution"
+                    ]
+                }
+                del acf_options["random_scalarization_distribution"]
+            else:
+                randomize_weights_kws = {}
             objective_weights_list = [
-                randomize_objective_weights(objective_weights, **acf_options)
+                randomize_objective_weights(objective_weights, **randomize_weights_kws)
                 for _ in range(n)
             ]
             acquisition_function_list = [
-                self.acqf_constructor(  # pyre-ignore: [28]
+                self.acqf_constructor(
                     model=model,
                     objective_weights=objective_weights,
                     outcome_constraints=outcome_constraints,
@@ -341,14 +340,32 @@ class MultiObjectiveBotorchModel(BotorchModel):
                 acq_function_list=acquisition_function_list,
                 bounds=bounds_,
                 inequality_constraints=_to_inequality_constraints(
-                    linear_constraints=linear_constraints
+                    linear_constraints=torch_opt_config.linear_constraints
                 ),
-                fixed_features=fixed_features,
+                fixed_features=torch_opt_config.fixed_features,
                 rounding_func=botorch_rounding_func,
                 **optimizer_options,
             )
         else:
-            acquisition_function = self.acqf_constructor(  # pyre-ignore: [28]
+            if (
+                objective_thresholds is None
+                or objective_thresholds[objective_weights != 0].isnan().any()
+            ):
+                full_objective_thresholds = infer_objective_thresholds(
+                    model=model,
+                    X_observed=none_throws(X_observed),
+                    objective_weights=full_objective_weights,
+                    outcome_constraints=full_outcome_constraints,
+                    subset_idcs=idcs,
+                    objective_thresholds=objective_thresholds,
+                )
+                # subset the objective thresholds
+                objective_thresholds = (
+                    full_objective_thresholds
+                    if idcs is None
+                    else full_objective_thresholds[idcs].clone()
+                )
+            acquisition_function = self.acqf_constructor(
                 model=model,
                 objective_weights=objective_weights,
                 objective_thresholds=objective_thresholds,
@@ -366,20 +383,20 @@ class MultiObjectiveBotorchModel(BotorchModel):
                 bounds=bounds_,
                 n=n,
                 inequality_constraints=_to_inequality_constraints(
-                    linear_constraints=linear_constraints
+                    linear_constraints=torch_opt_config.linear_constraints
                 ),
-                fixed_features=fixed_features,
+                fixed_features=torch_opt_config.fixed_features,
                 rounding_func=botorch_rounding_func,
                 **optimizer_options,
             )
         gen_metadata = {
             "expected_acquisition_value": expected_acquisition_value.tolist(),
-            "objective_thresholds": not_none(full_objective_thresholds).cpu(),
             "objective_weights": full_objective_weights.cpu(),
         }
-        return (
-            candidates.detach().cpu(),
-            torch.ones(n, dtype=self.dtype),
-            gen_metadata,
-            None,
+        if full_objective_thresholds is not None:
+            gen_metadata["objective_thresholds"] = full_objective_thresholds.cpu()
+        return TorchGenResults(
+            points=candidates.detach().cpu(),
+            weights=torch.ones(n, dtype=self.dtype),
+            gen_metadata=gen_metadata,
         )

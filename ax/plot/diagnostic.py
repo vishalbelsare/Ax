@@ -4,7 +4,10 @@
 # This source code is licensed under the MIT license found in the
 # LICENSE file in the root directory of this source tree.
 
-from typing import Any, Dict, List, Optional, Tuple
+# pyre-strict
+
+from copy import deepcopy
+from typing import Any
 
 import numpy as np
 import plotly.graph_objs as go
@@ -25,18 +28,18 @@ from ax.plot.base import (
 )
 from ax.plot.helper import compose_annotation
 from ax.plot.scatter import _error_scatter_data, _error_scatter_trace
-from ax.utils.common.typeutils import not_none
 from plotly import subplots
+from pyre_extensions import none_throws
 
 
 # type alias
-FloatList = List[float]
+FloatList = list[float]
 
 
 # Helper functions for plotting model fits
 def _get_min_max_with_errors(
     x: FloatList, y: FloatList, sd_x: FloatList, sd_y: FloatList
-) -> Tuple[float, float]:
+) -> tuple[float, float]:
     """Get min and max of a bivariate dataset (across variables).
 
     Args:
@@ -59,7 +62,7 @@ def _get_min_max_with_errors(
     return min_, max_
 
 
-def _diagonal_trace(min_: float, max_: float, visible: bool = True) -> Dict[str, Any]:
+def _diagonal_trace(min_: float, max_: float, visible: bool = True) -> dict[str, Any]:
     """Diagonal line trace from (min_, min_) to (max_, max_).
 
     Args:
@@ -68,6 +71,7 @@ def _diagonal_trace(min_: float, max_: float, visible: bool = True) -> Dict[str,
         visible: if True, trace is set to visible.
 
     """
+    # pyre-fixme[7]: Expected `Dict[str, typing.Any]` but got `Scatter`.
     return go.Scatter(
         x=[min_, max_],
         y=[min_, max_],
@@ -85,6 +89,7 @@ def _obs_vs_pred_dropdown_plot(
     show_context: bool = False,
     xlabel: str = "Actual Outcome",
     ylabel: str = "Predicted Outcome",
+    autoset_axis_limits: bool = True,
 ) -> go.Figure:
     """Plot a dropdown plot of observed vs. predicted values from a model.
 
@@ -95,11 +100,12 @@ def _obs_vs_pred_dropdown_plot(
         show_context: Show context on hover.
         xlabel: Label for x-axis.
         ylabel: Label for y-axis.
-
+        autoset_axis_limits: Automatically try to set the limit for each axis to focus
+            on the region of interest.
     """
     traces = []
     metric_dropdown = []
-
+    layout_axis_range = []
     if rel and data.status_quo_name is not None:
         if show_context:
             raise ValueError(
@@ -122,8 +128,34 @@ def _obs_vs_pred_dropdown_plot(
             if se_raw is not None
             else [0.0] * len(y_raw)
         )
+
         min_, max_ = _get_min_max_with_errors(y_raw, y_hat, se_raw, se_hat)
-        traces.append(_diagonal_trace(min_, max_, visible=(i == 0)))
+        if autoset_axis_limits:
+            y_raw_np = np.array(y_raw)
+            q1 = np.nanpercentile(y_raw_np, q=25, method="lower").min()
+            q3 = np.nanpercentile(y_raw_np, q=75, method="higher").max()
+            y_lower = q1 - 1.5 * (q3 - q1)
+            y_upper = q3 + 1.5 * (q3 - q1)
+            y_raw_np = y_raw_np.clip(y_lower, y_upper).tolist()
+            min_robust, max_robust = _get_min_max_with_errors(
+                y_raw_np, y_hat, se_raw, se_hat
+            )
+            y_padding = 0.05 * (max_robust - min_robust)
+            # Use the min/max of the limits
+            layout_axis_range.append(
+                [max(min_robust, min_) - y_padding, min(max_robust, max_) + y_padding]
+            )
+            traces.append(
+                _diagonal_trace(
+                    min(min_robust, min_) - y_padding,
+                    max(max_robust, max_) + y_padding,
+                    visible=(i == 0),
+                )
+            )
+        else:
+            layout_axis_range.append(None)
+            traces.append(_diagonal_trace(min_, max_, visible=(i == 0)))
+
         traces.append(
             _error_scatter_trace(
                 arms=list(data.in_sample.values()),
@@ -148,7 +180,17 @@ def _obs_vs_pred_dropdown_plot(
 
         # on dropdown change, restyle
         metric_dropdown.append(
-            {"args": ["visible", is_visible], "label": metric, "method": "restyle"}
+            {
+                "args": [
+                    {"visible": is_visible},
+                    {
+                        "xaxis.range": layout_axis_range[-1],
+                        "yaxis.range": layout_axis_range[-1],
+                    },
+                ],
+                "label": metric,
+                "method": "update",
+            }
         )
 
     updatemenus = [
@@ -207,6 +249,7 @@ def _obs_vs_pred_dropdown_plot(
             }
         ],
         xaxis={
+            "range": layout_axis_range[0],
             "title": xlabel,
             "zeroline": False,
             "mirror": True,
@@ -214,6 +257,7 @@ def _obs_vs_pred_dropdown_plot(
             "linewidth": 0.5,
         },
         yaxis={
+            "range": layout_axis_range[0],
             "title": ylabel,
             "zeroline": False,
             "mirror": True,
@@ -231,11 +275,11 @@ def _obs_vs_pred_dropdown_plot(
 
 
 def _get_batch_comparison_plot_data(
-    observations: List[Observation],
+    observations: list[Observation],
     batch_x: int,
     batch_y: int,
     rel: bool = False,
-    status_quo_name: Optional[str] = None,
+    status_quo_name: str | None = None,
 ) -> PlotData:
     """Compute PlotData for comparing repeated arms across trials.
 
@@ -264,7 +308,7 @@ def _get_batch_comparison_plot_data(
 
     # Assume input is well formed and metric_names are consistent across observations
     metric_names = observations[0].data.metric_names
-    insample_data: Dict[str, PlotInSampleArm] = {}
+    insample_data: dict[str, PlotInSampleArm] = {}
     for arm_name, x_observation in x_observations.items():
         # Restrict to arms present in both trials
         if arm_name not in y_observations:
@@ -309,17 +353,33 @@ def _get_batch_comparison_plot_data(
     )
 
 
-def _get_cv_plot_data(cv_results: List[CVResult]) -> PlotData:
+def _get_cv_plot_data(
+    cv_results: list[CVResult], label_dict: dict[str, str] | None
+) -> PlotData:
     if len(cv_results) == 0:
         return PlotData(
             metrics=[], in_sample={}, out_of_sample=None, status_quo_name=None
         )
 
-    # arm_name -> Arm data
-    insample_data: Dict[str, PlotInSampleArm] = {}
+    if label_dict is None:
+        label_dict = {}
+    # Apply label_dict to cv_results
+    cv_results = deepcopy(cv_results)  # Copy and edit in-place
+    for cv_i in cv_results:
+        cv_i.observed.data.metric_names = [
+            label_dict.get(m, m) for m in cv_i.observed.data.metric_names
+        ]
+        cv_i.predicted.metric_names = [
+            label_dict.get(m, m) for m in cv_i.predicted.metric_names
+        ]
 
-    # Assume input is well formed and this is consistent
-    metric_names = cv_results[0].predicted.metric_names
+    # arm_name -> Arm data
+    insample_data: dict[str, PlotInSampleArm] = {}
+
+    # Get the union of all metric_names seen in predictions
+    metric_names = list(
+        set().union(*(cv_result.predicted.metric_names for cv_result in cv_results))
+    )
 
     for rid, cv_result in enumerate(cv_results):
         arm_name = cv_result.observed.arm_name
@@ -372,7 +432,7 @@ def interact_empirical_model_validation(batch: BatchTrial, data: Data) -> AxPlot
     Returns:
         AxPlotConfig for the plot.
     """
-    insample_data: Dict[str, PlotInSampleArm] = {}
+    insample_data: dict[str, PlotInSampleArm] = {}
     metric_names = list(data.df["metric_name"].unique())
     for struct in batch.generator_run_structs:
         generator_run = struct.generator_run
@@ -420,11 +480,16 @@ def interact_empirical_model_validation(batch: BatchTrial, data: Data) -> AxPlot
 
     fig = _obs_vs_pred_dropdown_plot(data=plot_data, rel=False)
     fig["layout"]["title"] = "Cross-validation"
+    # pyre-fixme[6]: For 1st argument expected `Dict[str, typing.Any]` but got `Figure`.
     return AxPlotConfig(data=fig, plot_type=AxPlotTypes.GENERIC)
 
 
 def interact_cross_validation_plotly(
-    cv_results: List[CVResult], show_context: bool = True, caption: str = ""
+    cv_results: list[CVResult],
+    show_context: bool = True,
+    caption: str = "",
+    label_dict: dict[str, str] | None = None,
+    autoset_axis_limits: bool = True,
 ) -> go.Figure:
     """Interactive cross-validation (CV) plotting; select metric via dropdown.
 
@@ -434,11 +499,19 @@ def interact_cross_validation_plotly(
     Args:
         cv_results: cross-validation results.
         show_context: if True, show context on hover.
+        label_dict: optional map from real metric names to shortened names
+        autoset_axis_limits: Automatically try to set the limit for each axis to focus
+            on the region of interest.
 
     Returns a plotly.graph_objects.Figure
     """
-    data = _get_cv_plot_data(cv_results)
-    fig = _obs_vs_pred_dropdown_plot(data=data, rel=False, show_context=show_context)
+    data = _get_cv_plot_data(cv_results, label_dict=label_dict)
+    fig = _obs_vs_pred_dropdown_plot(
+        data=data,
+        rel=False,
+        show_context=show_context,
+        autoset_axis_limits=autoset_axis_limits,
+    )
     current_bmargin = fig["layout"]["margin"].b or 90
     caption_height = 100 * (len(caption) > 0)
     fig["layout"]["margin"].b = current_bmargin + caption_height
@@ -449,7 +522,11 @@ def interact_cross_validation_plotly(
 
 
 def interact_cross_validation(
-    cv_results: List[CVResult], show_context: bool = True
+    cv_results: list[CVResult],
+    show_context: bool = True,
+    caption: str = "",
+    label_dict: dict[str, str] | None = None,
+    autoset_axis_limits: bool = True,
 ) -> AxPlotConfig:
     """Interactive cross-validation (CV) plotting; select metric via dropdown.
 
@@ -459,21 +536,31 @@ def interact_cross_validation(
     Args:
         cv_results: cross-validation results.
         show_context: if True, show context on hover.
+        label_dict: optional map from real metric names to shortened names
+        autoset_axis_limits: Automatically try to set the limit for each axis to focus
+            on the region of interest.
 
     Returns an AxPlotConfig
     """
     return AxPlotConfig(
+        # pyre-fixme[6]: For 1st argument expected `Dict[str, typing.Any]` but got
+        #  `Figure`.
         data=interact_cross_validation_plotly(
-            cv_results=cv_results, show_context=show_context
+            cv_results=cv_results,
+            show_context=show_context,
+            caption=caption,
+            label_dict=label_dict,
+            autoset_axis_limits=autoset_axis_limits,
         ),
         plot_type=AxPlotTypes.GENERIC,
     )
 
 
 def tile_cross_validation(
-    cv_results: List[CVResult],
+    cv_results: list[CVResult],
     show_arm_details_on_hover: bool = True,
     show_context: bool = True,
+    label_dict: dict[str, str] | None = None,
 ) -> AxPlotConfig:
     """Tile version of CV plots; sorted by 'best fitting' outcomes.
 
@@ -488,10 +575,11 @@ def tile_cross_validation(
             parameterizations of arms on hover. Default is True.
         show_context: if True (default), display context on
             hover.
+        label_dict: optional map from real metric names to shortened names
 
     Returns a plotly.graph_objects.Figure
     """
-    data = _get_cv_plot_data(cv_results)
+    data = _get_cv_plot_data(cv_results, label_dict=label_dict)
     metrics = data.metrics
 
     # make subplots (2 plots per row)
@@ -538,8 +626,8 @@ def tile_cross_validation(
     # if odd number of plots, need to manually remove the last blank subplot
     # generated by `subplots.make_subplots`
     if len(metrics) % 2 == 1:
-        fig["layout"].pop("xaxis{}".format(nrows * ncols))
-        fig["layout"].pop("yaxis{}".format(nrows * ncols))
+        fig["layout"].pop(f"xaxis{nrows * ncols}")
+        fig["layout"].pop(f"yaxis{nrows * ncols}")
 
     # allocate 400 px per plot (equal aspect ratio)
     fig["layout"].update(
@@ -554,23 +642,26 @@ def tile_cross_validation(
     # update subplot title size and the axis labels
     for i, ant in enumerate(fig["layout"]["annotations"]):
         ant["font"].update(size=12)
-        fig["layout"]["xaxis{}".format(i + 1)].update(
+        fig["layout"][f"xaxis{i + 1}"].update(
             title="Actual Outcome", mirror=True, linecolor="black", linewidth=0.5
         )
-        fig["layout"]["yaxis{}".format(i + 1)].update(
+        fig["layout"][f"yaxis{i + 1}"].update(
             title="Predicted Outcome", mirror=True, linecolor="black", linewidth=0.5
         )
 
+    # pyre-fixme[6]: For 1st argument expected `Dict[str, typing.Any]` but got `Figure`.
     return AxPlotConfig(data=fig, plot_type=AxPlotTypes.GENERIC)
 
 
 def interact_batch_comparison(
-    observations: List[Observation],
+    observations: list[Observation],
     experiment: Experiment,
     batch_x: int,
     batch_y: int,
     rel: bool = False,
-    status_quo_name: Optional[str] = None,
+    status_quo_name: str | None = None,
+    x_label: str | None = None,
+    y_label: str | None = None,
 ) -> AxPlotConfig:
     """Compare repeated arms from two trials; select metric via dropdown.
 
@@ -580,19 +671,26 @@ def interact_batch_comparison(
         batch_y: Index of bach for y-axis.
         rel: Whether to relativize data against status_quo arm.
         status_quo_name: Name of the status_quo arm.
+        x_label: Label for the x-axis.
+        y_label: Label for the y-axis.
     """
     if isinstance(experiment, MultiTypeExperiment):
         observations = convert_mt_observations(observations, experiment)
     if not status_quo_name and experiment.status_quo:
-        status_quo_name = not_none(experiment.status_quo).name
+        status_quo_name = none_throws(experiment.status_quo).name
     plot_data = _get_batch_comparison_plot_data(
         observations, batch_x, batch_y, rel=rel, status_quo_name=status_quo_name
     )
+    if x_label is None:
+        x_label = f"Batch {batch_x}"
+    if y_label is None:
+        y_label = f"Batch {batch_y}"
     fig = _obs_vs_pred_dropdown_plot(
         data=plot_data,
         rel=rel,
-        xlabel="Batch {}".format(batch_x),
-        ylabel="Batch {}".format(batch_y),
+        xlabel=x_label,
+        ylabel=y_label,
     )
     fig["layout"]["title"] = "Repeated arms across trials"
+    # pyre-fixme[6]: For 1st argument expected `Dict[str, typing.Any]` but got `Figure`.
     return AxPlotConfig(data=fig, plot_type=AxPlotTypes.GENERIC)

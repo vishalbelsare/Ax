@@ -3,188 +3,163 @@
 # This source code is licensed under the MIT license found in the
 # LICENSE file in the root directory of this source tree.
 
-from dataclasses import dataclass
-from typing import List, Tuple
-
-import numpy as np
-import pandas as pd
-from ax.core.experiment import Experiment
-from ax.utils.common.base import Base
-from ax.utils.common.equality import equality_typechecker
+# pyre-strict
 
 # NOTE: Do not add `from __future__ import annotatations` to this file. Adding
 # `annotations` postpones evaluation of types and will break FBLearner's usage of
 # `BenchmarkResult` as return type annotation, used for serialization and rendering
 # in the UI.
 
+from collections.abc import Iterable
+from dataclasses import dataclass
 
-@dataclass(frozen=True)
+import numpy.typing as npt
+from ax.core.experiment import Experiment
+from ax.utils.common.base import Base
+from numpy import nanmean, nanquantile
+from pandas import DataFrame
+from scipy.stats import sem
+
+PERCENTILES = [0.25, 0.5, 0.75]
+
+
+@dataclass(eq=False)
 class BenchmarkResult(Base):
     """The result of a single optimization loop from one
-    (BenchmarkProblem, BenchmarkMethod) pair. More information will be added to the
-    BenchmarkResult as the suite develops.
+    (BenchmarkProblem, BenchmarkMethod) pair.
+
+    Args:
+        name: Name of the benchmark. Should make it possible to determine the
+            problem and the method.
+        seed: Seed used for determinism.
+        oracle_trace: For single-objective problems, element i of the
+            optimization trace is the best oracle value of the arms evaluated
+            after the first i trials.  For multi-objective problems, element i
+            of the optimization trace is the hypervolume of the oracle values of
+            the arms in the first i trials (which may be ``BatchTrial``s).
+            Oracle values are typically ground-truth (rather than noisy) and
+            evaluated at the target task and fidelity.
+        inference_trace: Inference trace comes from choosing a "best" point
+            based only on data that would be observable in realistic settings,
+            as specified by `BenchmarkMethod.get_best_parameters`,
+            and then evaluating the oracle value of that point according to the
+            problem's `OptimizationConfig`. For multi-objective problems, the
+            hypervolume of a set of points is considered.
+
+            By default, if it is not overridden,
+            `BenchmarkMethod.get_best_parameters` uses the empirical best point
+            if `use_model_predictions_for_best_point` is False and the best
+            point of those evaluated so far if it is True.
+
+            Note: This is not "inference regret", which is a lower-is-better value
+            that is relative to the best possible value. The inference value
+            trace is higher-is-better if the problem is a maximization problem
+            or if the problem is multi-objective (in which case hypervolume is
+            used). Hence, it is signed the same as ``oracle_trace`` and
+            ``optimization_trace``. ``score_trace`` is higher-is-better and
+            relative to the optimum.
+        optimization_trace: Either the ``oracle_trace`` or the
+            ``inference_trace``, depending on whether the ``BenchmarkProblem``
+            specifies ``report_inference_value``. Having ``optimization_trace``
+            specified separately is useful when we need just one value to
+            evaluate how well the benchmark went.
+        score_trace: The scores associated with the problem, typically either
+            the optimization_trace or inference_value_trace normalized to a
+            0-100 scale for comparability between problems.
+        fit_time: Total time spent fitting models.
+        gen_time: Total time spent generating candidates.
+        experiment: If not ``None``, the Ax experiment associated with the
+            optimization that generated this data. Either ``experiment`` or
+            ``experiment_storage_id`` must be provided.
+        experiment_storage_id: Pointer to location where experiment data can be read.
     """
 
     name: str
-    experiment: Experiment
+    seed: int
 
-    # Tracks best point if single-objective problem, max hypervolume if MOO
-    optimization_trace: np.ndarray
+    oracle_trace: npt.NDArray
+    inference_trace: npt.NDArray
+    optimization_trace: npt.NDArray
+    score_trace: npt.NDArray
+
     fit_time: float
     gen_time: float
 
-    @equality_typechecker
-    def __eq__(self, other: Base) -> bool:
-        if not isinstance(other, BenchmarkResult):
-            return False
+    experiment: Experiment | None = None
+    experiment_storage_id: str | None = None
 
-        return (
-            self.name == other.name
-            and self.experiment == other.experiment
-            and (self.optimization_trace == other.optimization_trace).all()
-            and self.fit_time == other.fit_time
-            and self.gen_time == other.gen_time
-        )
+    def __post_init__(self) -> None:
+        if self.experiment is not None and self.experiment_storage_id is not None:
+            raise ValueError(
+                "Cannot specify both an `experiment` and an "
+                "`experiment_storage_id` for the experiment."
+            )
+        if self.experiment is None and self.experiment_storage_id is None:
+            raise ValueError(
+                "Must provide an `experiment` or `experiment_storage_id` "
+                "to construct a BenchmarkResult."
+            )
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, eq=False)
 class AggregatedBenchmarkResult(Base):
     """The result of a benchmark test, or series of replications. Scalar data present
-    in the BenchmarkResult is here represented as (mean, sem) pairs. More information
-    will be added to the AggregatedBenchmarkResult as the suite develops.
+    in the BenchmarkResult is here represented as (mean, sem) pairs.
     """
 
     name: str
-    experiments: List[Experiment]
+    results: list[BenchmarkResult]
 
-    # mean, sem columns
-    optimization_trace: pd.DataFrame
+    # mean, sem, and quartile columns
+    optimization_trace: DataFrame
+    score_trace: DataFrame
 
     # (mean, sem) pairs
-    fit_time: Tuple[float, float]
-    gen_time: Tuple[float, float]
-
-    @equality_typechecker
-    def __eq__(self, other: Base) -> bool:
-        if not isinstance(other, AggregatedBenchmarkResult):
-            return False
-
-        return (
-            self.name == other.name
-            and self.experiments == other.experiments
-            and self.optimization_trace.eq(other.optimization_trace).all().all()
-            and self.fit_time == other.fit_time
-            and self.gen_time == other.gen_time
-        )
+    fit_time: list[float]
+    gen_time: list[float]
 
     @classmethod
     def from_benchmark_results(
         cls,
-        results: List[BenchmarkResult],
+        results: list[BenchmarkResult],
     ) -> "AggregatedBenchmarkResult":
+        """Aggregrates a list of BenchmarkResults. For various reasons (timeout, errors,
+        etc.) each BenchmarkResult may have a different number of trials; aggregated
+        traces and statistics are computed with and truncated to the minimum trial count
+        to ensure each replication is included.
+        """
+        # Extract average wall times and standard errors thereof
+        fit_time, gen_time = (
+            [nanmean(Ts), float(sem(Ts, ddof=1, nan_policy="propagate"))]
+            for Ts in zip(*((res.fit_time, res.gen_time) for res in results))
+        )
 
+        # Compute some statistics for each trace
+        trace_stats = {}
+        for name in ("optimization_trace", "score_trace"):
+            step_data = zip(*(getattr(res, name) for res in results))
+            stats = _get_stats(step_data=step_data, percentiles=PERCENTILES)
+            trace_stats[name] = stats
+
+        # Return aggregated results
         return cls(
             name=results[0].name,
-            experiments=[result.experiment for result in results],
-            optimization_trace=pd.DataFrame(
-                {
-                    "median": [
-                        np.median(
-                            [
-                                results[j].optimization_trace[i]
-                                for j in range(len(results))
-                            ]
-                        )
-                        for i in range(len(results[0].optimization_trace))
-                    ],
-                    "mean": [
-                        np.mean(
-                            [
-                                results[j].optimization_trace[i]
-                                for j in range(len(results))
-                            ]
-                        )
-                        for i in range(len(results[0].optimization_trace))
-                    ],
-                    "sem": [
-                        cls._series_to_sem(
-                            series=[
-                                results[j].optimization_trace[i]
-                                for j in range(len(results))
-                            ]
-                        )
-                        for i in range(len(results[0].optimization_trace))
-                    ],
-                }
-            ),
-            fit_time=cls._series_to_mean_sem(
-                series=[result.fit_time for result in results]
-            ),
-            gen_time=cls._series_to_mean_sem(
-                series=[result.gen_time for result in results]
-            ),
+            results=results,
+            fit_time=fit_time,
+            gen_time=gen_time,
+            **{name: DataFrame(stats) for name, stats in trace_stats.items()},
         )
 
-    @staticmethod
-    def _series_to_mean_sem(series: List[float]) -> Tuple[float, float]:
-        return (
-            np.mean(series),
-            AggregatedBenchmarkResult._series_to_sem(series=series),
-        )
 
-    @staticmethod
-    def _series_to_sem(series: List[float]) -> float:
-        return np.std(series, ddof=1) / np.sqrt(len(series))
-
-
-@dataclass(frozen=True)
-class ScoredBenchmarkResult(AggregatedBenchmarkResult):
-    """An AggregatedBenchmarkResult normalized against some baseline method (for the
-    same problem), typically Sobol. The score is calculated in such a way that 0
-    corresponds to performance equivalent with the baseline and 100 indicates the true
-    optimum was found.
-    """
-
-    baseline_result: AggregatedBenchmarkResult
-    score: np.ndarray
-
-    @equality_typechecker
-    def __eq__(self, other: Base) -> bool:
-        if not isinstance(other, ScoredBenchmarkResult):
-            return False
-
-        return (
-            super().__eq__(other)
-            and self.baseline_result == other.baseline_result
-            and (self.score == other.score).all()
-        )
-
-    @classmethod
-    def from_result_and_baseline(
-        cls,
-        aggregated_result: AggregatedBenchmarkResult,
-        baseline_result: AggregatedBenchmarkResult,
-        optimum: float,
-    ) -> "ScoredBenchmarkResult":
-        baseline = baseline_result.optimization_trace["mean"][
-            : len(aggregated_result.optimization_trace["mean"])
-        ]
-
-        score = (
-            100
-            * (
-                1
-                - (aggregated_result.optimization_trace["mean"] - optimum)
-                / (baseline - optimum)
-            )
-        ).to_numpy()
-
-        return cls(
-            name=aggregated_result.name,
-            experiments=aggregated_result.experiments,
-            optimization_trace=aggregated_result.optimization_trace,
-            fit_time=aggregated_result.fit_time,
-            gen_time=aggregated_result.gen_time,
-            baseline_result=baseline_result,
-            score=score,
-        )
+def _get_stats(
+    step_data: Iterable[npt.NDArray],
+    percentiles: list[float],
+) -> dict[str, list[float]]:
+    quantiles = []
+    stats = {"mean": [], "sem": []}
+    for step_vals in step_data:
+        stats["mean"].append(nanmean(step_vals))
+        stats["sem"].append(sem(step_vals, ddof=1, nan_policy="propagate"))
+        quantiles.append(nanquantile(step_vals, q=percentiles))
+    stats.update({f"P{100 * p:.0f}": q for p, q in zip(percentiles, zip(*quantiles))})
+    return stats

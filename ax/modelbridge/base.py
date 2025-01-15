@@ -4,15 +4,22 @@
 # This source code is licensed under the MIT license found in the
 # LICENSE file in the root directory of this source tree.
 
+# pyre-strict
+
+import json
 import time
+import warnings
 from abc import ABC
 from collections import OrderedDict
+from collections.abc import MutableMapping
 from copy import deepcopy
-from dataclasses import dataclass
-from typing import Any, Dict, List, MutableMapping, Optional, Set, Tuple, Type, Union
+from dataclasses import dataclass, field
 
-import numpy as np
+from logging import Logger
+from typing import Any
+
 from ax.core.arm import Arm
+from ax.core.base_trial import NON_ABANDONED_STATUSES, TrialStatus
 from ax.core.data import Data
 from ax.core.experiment import Experiment
 from ax.core.generator_run import extract_arm_predictions, GeneratorRun
@@ -21,6 +28,7 @@ from ax.core.observation import (
     ObservationData,
     ObservationFeatures,
     observations_from_data,
+    recombine_observations,
     separate_observations,
 )
 from ax.core.optimization_config import OptimizationConfig
@@ -28,30 +36,42 @@ from ax.core.parameter import ParameterType, RangeParameter
 from ax.core.search_space import SearchSpace
 from ax.core.types import (
     TCandidateMetadata,
-    TGenMetadata,
     TModelCov,
     TModelMean,
     TModelPredict,
+    TParameterization,
 )
+from ax.exceptions.core import UnsupportedError, UserInputError
+from ax.exceptions.model import ModelBridgeMethodNotImplementedError
 from ax.modelbridge.transforms.base import Transform
 from ax.modelbridge.transforms.cast import Cast
+from ax.modelbridge.transforms.fill_missing_parameters import FillMissingParameters
 from ax.models.types import TConfig
 from ax.utils.common.logger import get_logger
-from ax.utils.common.typeutils import checked_cast, not_none
+from ax.utils.common.typeutils import checked_cast
+from botorch.exceptions.warnings import InputDataWarning
+from pyre_extensions import none_throws
+
+logger: Logger = get_logger(__name__)
 
 
-logger = get_logger(__name__)
-
-
-@dataclass
+@dataclass(frozen=True)
 class BaseGenArgs:
     search_space: SearchSpace
-    optimization_config: OptimizationConfig
-    pending_observations: Dict[str, List[ObservationFeatures]]
-    fixed_features: ObservationFeatures
+    optimization_config: OptimizationConfig | None
+    pending_observations: dict[str, list[ObservationFeatures]]
+    fixed_features: ObservationFeatures | None
 
 
-class ModelBridge(ABC):
+@dataclass(frozen=True)
+class GenResults:
+    observation_features: list[ObservationFeatures]
+    weights: list[float]
+    best_observation_features: ObservationFeatures | None = None
+    gen_metadata: dict[str, Any] = field(default_factory=dict)
+
+
+class ModelBridge(ABC):  # noqa: B024 -- ModelBridge doesn't have any abstract methods.
     """The main object for using models in Ax.
 
     ModelBridge specifies 3 methods for using models:
@@ -79,16 +99,20 @@ class ModelBridge(ABC):
     def __init__(
         self,
         search_space: SearchSpace,
+        # pyre-fixme[2]: Parameter annotation cannot be `Any`.
         model: Any,
-        transforms: Optional[List[Type[Transform]]] = None,
-        experiment: Optional[Experiment] = None,
-        data: Optional[Data] = None,
-        transform_configs: Optional[Dict[str, TConfig]] = None,
-        status_quo_name: Optional[str] = None,
-        status_quo_features: Optional[ObservationFeatures] = None,
-        optimization_config: Optional[OptimizationConfig] = None,
+        transforms: list[type[Transform]] | None = None,
+        experiment: Experiment | None = None,
+        data: Data | None = None,
+        transform_configs: dict[str, TConfig] | None = None,
+        status_quo_name: str | None = None,
+        status_quo_features: ObservationFeatures | None = None,
+        optimization_config: OptimizationConfig | None = None,
+        expand_model_space: bool = True,
         fit_out_of_design: bool = False,
         fit_abandoned: bool = False,
+        fit_tracking_metrics: bool = True,
+        fit_on_init: bool = True,
     ) -> None:
         """
         Applies transforms and fits model.
@@ -96,7 +120,9 @@ class ModelBridge(ABC):
         Args:
             experiment: Is used to get arm parameters. Is not mutated.
             search_space: Search space for fitting the model. Constraints need
-                not be the same ones used in gen.
+                not be the same ones used in gen. RangeParameter bounds are
+                considered soft and will be expanded to match the range of the
+                data sent in for fitting, if expand_model_space is True.
             data: Ax Data.
             model: Interface will be specified in subclass. If model requires
                 initialization, that should be done prior to its use here.
@@ -112,90 +138,176 @@ class ModelBridge(ABC):
                 Either this or status_quo_name should be specified, not both.
             optimization_config: Optimization config defining how to optimize
                 the model.
-            fit_out_of_design: If specified, all training data is returned.
-                Otherwise, only in design points are returned.
+            expand_model_space: If True, expand range parameter bounds in model
+                space to cover given training data. This will make the modeling
+                space larger than the search space if training data fall outside
+                the search space.
+            fit_out_of_design: If specified, all training data are used.
+                Otherwise, only in design points are used.
             fit_abandoned: Whether data for abandoned arms or trials should be
                 included in model training data. If ``False``, only
                 non-abandoned points are returned.
+            fit_tracking_metrics: Whether to fit a model for tracking metrics.
+                Setting this to False will improve runtime at the expense of
+                models not being available for predicting tracking metrics.
+                NOTE: This can only be set to False when the optimization config
+                is provided.
+            fit_on_init: Whether to fit the model on initialization. This can
+                be used to skip model fitting when a fitted model is not needed.
+                To fit the model afterwards, use `_process_and_transform_data`
+                to get the transformed inputs and call `_fit_if_implemented` with
+                the transformed inputs.
         """
-        t_fit_start = time.time()
+        t_fit_start = time.monotonic()
         transforms = transforms or []
-        # pyre-ignore: Cast is a Tranform
-        transforms: List[Type[Transform]] = [Cast] + transforms
+        transforms = [Cast] + transforms
 
-        self._metric_names: Set[str] = set()
-        self._training_data: List[Observation] = []
-        self._optimization_config: Optional[OptimizationConfig] = optimization_config
-        self._training_in_design: List[bool] = []
-        self._status_quo: Optional[Observation] = None
-        self._arms_by_signature: Optional[Dict[str, Arm]] = None
+        self.fit_time: float = 0.0
+        self.fit_time_since_gen: float = 0.0
+        self._metric_names: set[str] = set()
+        self._training_data: list[Observation] = []
+        self._optimization_config: OptimizationConfig | None = optimization_config
+        self._training_in_design: list[bool] = []
+        self._status_quo: Observation | None = None
+        self._status_quo_name: str | None = None
+        self._arms_by_signature: dict[str, Arm] | None = None
         self.transforms: MutableMapping[str, Transform] = OrderedDict()
-        self._model_key: Optional[str] = None
-        self._model_kwargs: Optional[Dict[str, Any]] = None
-        self._bridge_kwargs: Optional[Dict[str, Any]] = None
-
-        self._model_space = search_space.clone()
+        self._model_key: str | None = None
+        self._model_kwargs: dict[str, Any] | None = None
+        self._bridge_kwargs: dict[str, Any] | None = None
+        # The space used for optimization.
+        self._search_space: SearchSpace = search_space.clone()
+        # The space used for modeling. Might be larger than the optimization
+        # space to cover training data.
+        self._model_space: SearchSpace = search_space.clone()
         self._raw_transforms = transforms
-        self._transform_configs: Optional[Dict[str, TConfig]] = transform_configs
+        self._transform_configs: dict[str, TConfig] | None = transform_configs
         self._fit_out_of_design = fit_out_of_design
         self._fit_abandoned = fit_abandoned
-        imm = experiment and experiment.immutable_search_space_and_opt_config
-        self._experiment_has_immutable_search_space_and_opt_config = imm
+        self._fit_tracking_metrics = fit_tracking_metrics
+        self.outcomes: list[str] = []
+        self._experiment_has_immutable_search_space_and_opt_config: bool = (
+            experiment is not None and experiment.immutable_search_space_and_opt_config
+        )
+        self._experiment_properties: dict[str, Any] = {}
+        self._experiment: Experiment | None = experiment
+
         if experiment is not None:
             if self._optimization_config is None:
                 self._optimization_config = experiment.optimization_config
             self._arms_by_signature = experiment.arms_by_signature
+            self._experiment_properties = experiment._properties
 
-        observations = (
-            observations_from_data(
-                experiment=experiment,
-                data=data,
-                include_abandoned=self._fit_abandoned,
-            )
-            if experiment is not None and data is not None
-            else []
+        if self._fit_tracking_metrics is False:
+            if self._optimization_config is None:
+                raise UserInputError(
+                    "Optimization config is required when "
+                    "`fit_tracking_metrics` is False."
+                )
+            self.outcomes = sorted(self._optimization_config.metrics.keys())
+
+        # Set training data (in the raw / untransformed space). This also omits
+        # out-of-design and abandoned observations depending on the corresponding flags.
+        observations_raw = self._prepare_observations(experiment=experiment, data=data)
+        if expand_model_space:
+            self._set_model_space(observations=observations_raw)
+        observations_raw = self._set_training_data(
+            observations=observations_raw, search_space=self._model_space
         )
-        obs_feats_raw, obs_data_raw = self._set_training_data(
-            observations=observations, search_space=search_space
-        )
-        # Set model status quo
+
+        # Set model status quo.
         # NOTE: training data must be set before setting the status quo.
         self._set_status_quo(
             experiment=experiment,
             status_quo_name=status_quo_name,
             status_quo_features=status_quo_features,
         )
-        obs_feats, obs_data, search_space = self._transform_data(
-            obs_feats=obs_feats_raw,
-            obs_data=obs_data_raw,
-            search_space=search_space,
-            transforms=transforms,
-            transform_configs=transform_configs,
+
+        # Save model, apply terminal transform, and fit.
+        self.model = model
+        if fit_on_init:
+            observations, search_space = self._transform_data(
+                observations=observations_raw,
+                search_space=self._model_space,
+                transforms=self._raw_transforms,
+                transform_configs=self._transform_configs,
+            )
+            self._fit_if_implemented(
+                search_space=search_space,
+                observations=observations,
+                time_so_far=time.monotonic() - t_fit_start,
+            )
+
+    def _fit_if_implemented(
+        self,
+        search_space: SearchSpace,
+        observations: list[Observation],
+        time_so_far: float,
+    ) -> None:
+        r"""Fits the model if `_fit` is implemented and stores fit time.
+
+        Args:
+            search_space: A transformed search space for fitting the model.
+            observations: The observations to fit the model with. These should
+                also be transformed.
+            time_so_far: Time spent in initializing the model up to
+                `_fit_if_implemented` call.
+        """
+        try:
+            t_fit_start = time.monotonic()
+            self._fit(
+                model=self.model,
+                search_space=search_space,
+                observations=observations,
+            )
+            increment = time.monotonic() - t_fit_start + time_so_far
+            self.fit_time += increment
+            self.fit_time_since_gen += increment
+        except ModelBridgeMethodNotImplementedError:
+            pass
+
+    def _process_and_transform_data(
+        self,
+        experiment: Experiment | None = None,
+        data: Data | None = None,
+    ) -> tuple[list[Observation], SearchSpace]:
+        r"""Processes the data into observations and returns transformed
+        observations and the search space. This packages the following methods:
+        * self._prepare_observations
+        * self._set_training_data
+        * self._transform_data
+        """
+        observations = self._prepare_observations(experiment=experiment, data=data)
+        observations_raw = self._set_training_data(
+            observations=observations, search_space=self._model_space
+        )
+        return self._transform_data(
+            observations=observations_raw,
+            search_space=self._model_space,
+            transforms=self._raw_transforms,
+            transform_configs=self._transform_configs,
         )
 
-        # Save model, apply terminal transform, and fit
-        self.model = model
-        try:
-            self._fit(
-                model=model,
-                search_space=search_space,
-                observation_features=obs_feats,
-                observation_data=obs_data,
-            )
-            self.fit_time = time.time() - t_fit_start
-            self.fit_time_since_gen = float(self.fit_time)
-        except NotImplementedError:
-            self.fit_time = 0.0
-            self.fit_time_since_gen = 0.0
+    def _prepare_observations(
+        self, experiment: Experiment | None, data: Data | None
+    ) -> list[Observation]:
+        if experiment is None or data is None:
+            return []
+        return observations_from_data(
+            experiment=experiment,
+            data=data,
+            statuses_to_include=self.statuses_to_fit,
+            statuses_to_include_map_metric=self.statuses_to_fit_map_metric,
+        )
 
     def _transform_data(
         self,
-        obs_feats: List[ObservationFeatures],
-        obs_data: List[ObservationData],
+        observations: list[Observation],
         search_space: SearchSpace,
-        transforms: Optional[List[Type[Transform]]],
-        transform_configs: Optional[Dict[str, TConfig]],
-    ) -> Tuple[List[ObservationFeatures], List[ObservationData], SearchSpace]:
+        transforms: list[type[Transform]] | None,
+        transform_configs: dict[str, TConfig] | None,
+        assign_transforms: bool = True,
+    ) -> tuple[list[Observation], SearchSpace]:
         """Initialize transforms and apply them to provided data."""
         # Initialize transforms
         search_space = search_space.clone()
@@ -206,118 +318,129 @@ class ModelBridge(ABC):
             for t in transforms:
                 t_instance = t(
                     search_space=search_space,
-                    observation_features=obs_feats,
-                    observation_data=obs_data,
+                    observations=observations,
                     modelbridge=self,
                     config=transform_configs.get(t.__name__, None),
                 )
                 search_space = t_instance.transform_search_space(search_space)
-                obs_feats = t_instance.transform_observation_features(obs_feats)
-                obs_data = t_instance.transform_observation_data(obs_data, obs_feats)
-                self.transforms[t.__name__] = t_instance
+                observations = t_instance.transform_observations(observations)
+                if assign_transforms:
+                    self.transforms[t.__name__] = t_instance
 
-        return obs_feats, obs_data, search_space
+        return observations, search_space
 
     def _prepare_training_data(
-        self, observations: List[Observation]
-    ) -> Tuple[List[ObservationFeatures], List[ObservationData]]:
+        self, observations: list[Observation]
+    ) -> list[Observation]:
         observation_features, observation_data = separate_observations(observations)
         if len(observation_features) != len(set(observation_features)):
             raise ValueError(
-                "Observation features not unique."
+                "Observation features are not unique. "
                 "Something went wrong constructing training data..."
             )
-        return observation_features, observation_data
+        return observations
 
     def _set_training_data(
-        self, observations: List[Observation], search_space: SearchSpace
-    ) -> Tuple[List[ObservationFeatures], List[ObservationData]]:
+        self, observations: list[Observation], search_space: SearchSpace
+    ) -> list[Observation]:
         """Store training data, not-transformed.
 
         If the modelbridge specifies _fit_out_of_design, all training data is
         returned. Otherwise, only in design points are returned.
         """
-        observation_features, observation_data = self._prepare_training_data(
-            observations=observations
-        )
+        observations = self._prepare_training_data(observations=observations)
         self._training_data = deepcopy(observations)
-        self._metric_names: Set[str] = set()
-        for obsd in observation_data:
-            self._metric_names.update(obsd.metric_names)
+        self._metric_names: set[str] = set()
+        for obs in observations:
+            self._metric_names.update(obs.data.metric_names)
         return self._process_in_design(
             search_space=search_space,
-            observation_features=observation_features,
-            observation_data=observation_data,
-        )
-
-    def _extend_training_data(
-        self, observations: List[Observation]
-    ) -> Tuple[List[ObservationFeatures], List[ObservationData]]:
-        """Extend and return training data, not-transformed.
-
-        If the modelbridge specifies _fit_out_of_design, all training data is
-        returned. Otherwise, only in design points are returned.
-
-        Args:
-            observations: New observations.
-
-        Returns:
-            observation_features: New + old observation features.
-            observation_data: New + old observation data.
-        """
-        observation_features, observation_data = self._prepare_training_data(
-            observations=observations
-        )
-        for obsd in observation_data:
-            for metric_name in obsd.metric_names:
-                if metric_name not in self._metric_names:
-                    raise ValueError(
-                        f"Unrecognised metric {metric_name}; cannot update "
-                        "training data with metrics that were not in the original "
-                        "training data."
-                    )
-        # Initialize with all points in design.
-        self._training_data.extend(deepcopy(observations))
-        all_observation_features, all_observation_data = separate_observations(
-            self.get_training_data()
-        )
-        return self._process_in_design(
-            search_space=self._model_space,
-            observation_features=all_observation_features,
-            observation_data=all_observation_data,
+            observations=observations,
         )
 
     def _process_in_design(
         self,
         search_space: SearchSpace,
-        observation_features: List[ObservationFeatures],
-        observation_data: List[ObservationData],
-    ) -> Tuple[List[ObservationFeatures], List[ObservationData]]:
+        observations: list[Observation],
+    ) -> list[Observation]:
         """Set training_in_design, and decide whether to filter out of design points."""
         # Don't filter points.
         if self._fit_out_of_design:
             # Use all data for training
             # Set training_in_design to True for all observations so that
             # all observations are used in CV and plotting
-            self.training_in_design = [True] * len(observation_features)
-            return observation_features, observation_data
-        in_design = [
+            self.training_in_design = [True] * len(observations)
+            return observations
+        in_design = self._compute_in_design(
+            search_space=search_space, observations=observations
+        )
+        self.training_in_design = in_design
+        in_design_obs = [
+            observations[i] for i, is_in_design in enumerate(in_design) if is_in_design
+        ]
+        return in_design_obs
+
+    def _compute_in_design(
+        self,
+        search_space: SearchSpace,
+        observations: list[Observation],
+    ) -> list[bool]:
+        """Compute in-design status for each observation, after filling missing
+        values if FillMissingParameters transform is used."""
+        observation_features = [obs.features for obs in observations]
+        if (
+            self._transform_configs is not None
+            and "FillMissingParameters" in self._transform_configs
+        ):
+            t = FillMissingParameters(
+                config=self._transform_configs["FillMissingParameters"]
+            )
+            observation_features = t.transform_observation_features(
+                deepcopy(observation_features)
+            )
+        return [
             search_space.check_membership(obsf.parameters)
             for obsf in observation_features
         ]
-        self.training_in_design = in_design
-        in_design_indices = [i for i, in_design in enumerate(in_design) if in_design]
-        in_design_features = [observation_features[i] for i in in_design_indices]
-        in_design_data = [observation_data[i] for i in in_design_indices]
-        return in_design_features, in_design_data
+
+    def _set_model_space(self, observations: list[Observation]) -> None:
+        """Set model space, possibly expanding range parameters to cover data."""
+        # If fill for missing values, include those in expansion.
+        fill_values: TParameterization | None = None
+        if (
+            self._transform_configs is not None
+            and "FillMissingParameters" in self._transform_configs
+        ):
+            fill_values = self._transform_configs[  # pyre-ignore[9]
+                "FillMissingParameters"
+            ].get("fill_values", None)
+        # Extract parameter values across arms
+        parameter_dicts = [obs.features.parameters for obs in observations]
+        if fill_values is not None:
+            parameter_dicts.append(fill_values)
+        param_vals = {p_name: [] for p_name in self._model_space.parameters.keys()}
+        for parameter_dict in parameter_dicts:
+            for p_name in self._model_space.parameters.keys():
+                p_val = parameter_dict.get(p_name, None)
+                if p_val is not None:
+                    param_vals[p_name].append(p_val)
+
+        # Update model space. Expand bounds as needed to cover the values found
+        # in the data.
+        for p in self._model_space.parameters.values():
+            if len(param_vals[p.name]) == 0:
+                continue
+            if isinstance(p, RangeParameter):
+                p.lower = min(p.lower, min(param_vals[p.name]))
+                p.upper = max(p.upper, max(param_vals[p.name]))
 
     def _set_status_quo(
         self,
-        experiment: Optional[Experiment],
-        status_quo_name: Optional[str],
-        status_quo_features: Optional[ObservationFeatures],
+        experiment: Experiment | None,
+        status_quo_name: str | None,
+        status_quo_features: ObservationFeatures | None,
     ) -> None:
-        """Set model status quo.
+        """Set model status quo by matching status_quo_name or status_quo_features.
 
         First checks for status quo in inputs status_quo_name and
         status_quo_features. If neither of these is provided, checks the
@@ -329,7 +452,8 @@ class ModelBridge(ABC):
             status_quo_name: Name of status quo arm.
             status_quo_features: Features for status quo.
         """
-        self._status_quo: Optional[Observation] = None
+        self._status_quo: Observation | None = None
+        sq_obs = None
 
         if (
             status_quo_name is None
@@ -347,17 +471,6 @@ class ModelBridge(ABC):
             sq_obs = [
                 obs for obs in self._training_data if obs.arm_name == status_quo_name
             ]
-
-            if len(sq_obs) == 0:
-                logger.warning(f"Status quo {status_quo_name} not present in data")
-            elif len(sq_obs) > 1:
-                logger.warning(  # pragma: no cover
-                    f"Status quo {status_quo_name} found in data with multiple "
-                    "features. Use status_quo_features to specify which to use."
-                )
-            else:
-                self._status_quo = sq_obs[0]
-
         elif status_quo_features is not None:
             sq_obs = [
                 obs
@@ -366,22 +479,56 @@ class ModelBridge(ABC):
                 and (obs.features.trial_index == status_quo_features.trial_index)
             ]
 
+        # if status_quo_name or status_quo_features is used for matching status quo
+        if sq_obs is not None:
             if len(sq_obs) == 0:
-                logger.warning(
-                    f"Status quo features {status_quo_features} not found in data."
-                )
-            else:
-                # len(sq_obs) will not be > 1,
-                # unique features verified in _set_training_data.
-                self._status_quo = sq_obs[0]
+                logger.warning(f"Status quo {status_quo_name} not present in data")
+            elif len(sq_obs) >= 1:
+                # status quo name (not features as trial index is part of the
+                # observation features) should be consistent even if we have multiple
+                # observations of the status quo.
+                # This is useful for getting status_quo_data_by_trial
+                self._status_quo_name = sq_obs[0].arm_name
+                if len(sq_obs) > 1:
+                    logger.warning(
+                        f"Status quo {status_quo_name} found in data with multiple "
+                        "features. Use status_quo_features to specify which to use."
+                    )
+                else:
+                    # if there is a unique status_quo, set it
+                    # unique features verified in _set_training_data.
+                    self._status_quo = sq_obs[0]
 
     @property
-    def status_quo(self) -> Optional[Observation]:
+    def status_quo_data_by_trial(self) -> dict[int, ObservationData] | None:
+        """A map of trial index to the status quo observation data of each trial"""
+        return _get_status_quo_by_trial(
+            observations=self._training_data,
+            status_quo_name=(
+                self._status_quo_name
+                if self.status_quo is None
+                else self.status_quo.arm_name
+            ),
+            status_quo_features=(
+                None if self.status_quo is None else self.status_quo.features
+            ),
+        )
+
+    @property
+    def status_quo(self) -> Observation | None:
         """Observation corresponding to status quo, if any."""
         return self._status_quo
 
     @property
-    def metric_names(self) -> Set[str]:
+    def status_quo_name(self) -> str | None:
+        """Name of status quo, if any."""
+        if self._status_quo is not None:
+            if self._status_quo.arm_name is not None:
+                return self._status_quo.arm_name
+        return self._status_quo_name
+
+    @property
+    def metric_names(self) -> set[str]:
         """Metric names present in training data."""
         return self._metric_names
 
@@ -390,19 +537,31 @@ class ModelBridge(ABC):
         """SearchSpace used to fit model."""
         return self._model_space
 
-    def get_training_data(self) -> List[Observation]:
+    def get_training_data(self) -> list[Observation]:
         """A copy of the (untransformed) data with which the model was fit."""
         return deepcopy(self._training_data)
 
     @property
-    def training_in_design(self) -> List[bool]:
+    def training_in_design(self) -> list[bool]:
         """For each observation in the training data, a bool indicating if it
         is in-design for the model.
         """
         return self._training_in_design
 
+    @property
+    def statuses_to_fit(self) -> set[TrialStatus]:
+        """Statuses to fit the model on."""
+        if self._fit_abandoned:
+            return set(TrialStatus)
+        return NON_ABANDONED_STATUSES
+
+    @property
+    def statuses_to_fit_map_metric(self) -> set[TrialStatus]:
+        """Statuses to fit the model on."""
+        return {TrialStatus.COMPLETED}
+
     @training_in_design.setter
-    def training_in_design(self, training_in_design: List[bool]) -> None:
+    def training_in_design(self, training_in_design: list[bool]) -> None:
         if len(training_in_design) != len(self._training_data):
             raise ValueError(
                 f"In-design indicators not same length ({len(training_in_design)})"
@@ -420,17 +579,19 @@ class ModelBridge(ABC):
 
     def _fit(
         self,
+        # pyre-fixme[2]: Parameter annotation cannot be `Any`.
         model: Any,
         search_space: SearchSpace,
-        observation_features: List[ObservationFeatures],
-        observation_data: List[ObservationData],
+        observations: list[Observation],
     ) -> None:
         """Apply terminal transform and fit model."""
-        raise NotImplementedError  # pragma: no cover
+        raise ModelBridgeMethodNotImplementedError(
+            f"{self.__class__.__name__} does not implement `_fit`."
+        )
 
     def _batch_predict(
-        self, observation_features: List[ObservationFeatures]
-    ) -> List[ObservationData]:
+        self, observation_features: list[ObservationFeatures]
+    ) -> list[ObservationData]:
         """Predict a list of ObservationFeatures together."""
         # Get modifiable version
         observation_features = deepcopy(observation_features)
@@ -444,18 +605,17 @@ class ModelBridge(ABC):
         observation_data = self._predict(observation_features)
 
         # Apply reverse transforms, in reverse order
-        for t in reversed(self.transforms.values()):  # noqa T484
-            observation_features = t.untransform_observation_features(
-                observation_features
-            )
-            observation_data = t.untransform_observation_data(
-                observation_data, observation_features
-            )
-        return observation_data
+        pred_observations = recombine_observations(
+            observation_features=observation_features, observation_data=observation_data
+        )
+
+        for t in reversed(list(self.transforms.values())):
+            pred_observations = t.untransform_observations(pred_observations)
+        return [obs.data for obs in pred_observations]
 
     def _single_predict(
-        self, observation_features: List[ObservationFeatures]
-    ) -> List[ObservationData]:
+        self, observation_features: list[ObservationFeatures]
+    ) -> list[ObservationData]:
         """Predict one ObservationFeature at a time."""
         observation_data = []
         for obsf in observation_features:
@@ -488,7 +648,33 @@ class ModelBridge(ABC):
                 observation_data.append(observation.data)
         return observation_data
 
-    def predict(self, observation_features: List[ObservationFeatures]) -> TModelPredict:
+    def _predict_observation_data(
+        self, observation_features: list[ObservationFeatures]
+    ) -> list[ObservationData]:
+        """
+        Like 'predict' method, but returns results as a list of ObservationData
+
+        Predictions are made for all outcomes.
+        If an out-of-design observation can successfully be transformed,
+        the predicted value will be returned.
+        Othwerise, we will attempt to find that observation in the training data
+        and return the raw value.
+
+        Args:
+            observation_features: observation features
+
+        Returns:
+            List of `ObservationData`
+        """
+        # Predict in single batch.
+        try:
+            observation_data = self._batch_predict(observation_features)
+        # Predict one by one.
+        except (TypeError, ValueError):
+            observation_data = self._single_predict(observation_features)
+        return observation_data
+
+    def predict(self, observation_features: list[ObservationFeatures]) -> TModelPredict:
         """Make model predictions (mean and covariance) for the given
         observation features.
 
@@ -509,22 +695,29 @@ class ModelBridge(ABC):
             - Nested dictionary with cov['metric1']['metric2'] a list of
               cov(metric1@x, metric2@x) for x in observation_features.
         """
-        # Predict in single batch.
-        try:
-            observation_data = self._batch_predict(observation_features)
-        # Predict one by one.
-        except (TypeError, ValueError):
-            observation_data = self._single_predict(observation_features)
+        # Make sure that input is a list of ObservationFeatures. If you pass in
+        # arms, the code runs but it doesn't apply the transforms.
+        if not all(
+            isinstance(obsf, ObservationFeatures) for obsf in observation_features
+        ):
+            raise UserInputError(
+                "Input to predict must be a list of `ObservationFeatures`."
+            )
+        observation_data = self._predict_observation_data(
+            observation_features=observation_features
+        )
         f, cov = unwrap_observation_data(observation_data)
         return f, cov
 
     def _predict(
-        self, observation_features: List[ObservationFeatures]
-    ) -> List[ObservationData]:
+        self, observation_features: list[ObservationFeatures]
+    ) -> list[ObservationData]:
         """Apply terminal transform, predict, and reverse terminal transform on
         output.
         """
-        raise NotImplementedError  # pragma: no cover
+        raise ModelBridgeMethodNotImplementedError(
+            f"{self.__class__.__name__} does not implement `_predict`."
+        )
 
     def update(self, new_data: Data, experiment: Experiment) -> None:
         """Update the model bridge and the underlying model with new data. This
@@ -539,63 +732,17 @@ class ModelBridge(ABC):
                 `update`.
             experiment: Experiment, in which this data was obtained.
         """
-        t_update_start = time.time()
-        observations = (
-            observations_from_data(
-                experiment=experiment,
-                data=new_data,
-                include_abandoned=self._fit_abandoned,
-            )
-            if experiment is not None and new_data is not None
-            else []
-        )
-        obs_feats_raw, obs_data_raw = self._extend_training_data(
-            observations=observations
-        )
-        obs_feats, obs_data, search_space = self._transform_data(
-            obs_feats=obs_feats_raw,
-            obs_data=obs_data_raw,
-            search_space=self._model_space,
-            transforms=self._raw_transforms,
-            transform_configs=self._transform_configs,
-        )
-        self._update(
-            search_space=search_space,
-            observation_features=obs_feats,
-            observation_data=obs_data,
-        )
-        self.fit_time += time.time() - t_update_start
-        self.fit_time_since_gen += time.time() - t_update_start
-
-    def _update(
-        self,
-        search_space: SearchSpace,
-        observation_features: List[ObservationFeatures],
-        observation_data: List[ObservationData],
-    ) -> None:
-        """Apply terminal transform and update model.
-
-        Note: This function requires ALL observation_features and
-        observation_data observed thus far, not just the new data to update with.
-
-        Args:
-            observation_features: All observation features observed so far.
-            observation_data: All observation data observed so far.
-        """
-        raise NotImplementedError  # pragma: no cover
+        raise DeprecationWarning("ModelBridge.update is deprecated. Use `fit` instead.")
 
     def _get_transformed_gen_args(
         self,
         search_space: SearchSpace,
-        optimization_config: Optional[OptimizationConfig] = None,
-        pending_observations: Optional[Dict[str, List[ObservationFeatures]]] = None,
-        fixed_features: Optional[ObservationFeatures] = None,
+        optimization_config: OptimizationConfig | None = None,
+        pending_observations: dict[str, list[ObservationFeatures]] | None = None,
+        fixed_features: ObservationFeatures | None = None,
     ) -> BaseGenArgs:
         if pending_observations is None:
             pending_observations = {}
-        if fixed_features is None:
-            fixed_features = ObservationFeatures({})
-
         if optimization_config is None:
             optimization_config = (
                 self._optimization_config.clone()
@@ -603,11 +750,24 @@ class ModelBridge(ABC):
                 else None
             )
         else:
+            if not self._fit_tracking_metrics:
+                # Check that the optimization config has the same metrics as
+                # the original one. Otherwise, we may attempt to optimize over
+                # metrics that do not have a fitted model.
+                outcomes = set(optimization_config.metrics.keys())
+                if not outcomes.issubset(self.outcomes):
+                    raise UnsupportedError(
+                        "When fit_tracking_metrics is False, the optimization config "
+                        "can only include metrics that were included in the "
+                        "optimization config used while initializing the ModelBridge. "
+                        f"Metrics {outcomes} is not a subset of {self.outcomes}."
+                    )
             optimization_config = optimization_config.clone()
 
         # TODO(T34225037): replace deepcopy with native clone() in Ax
         pending_observations = deepcopy(pending_observations)
         fixed_features = deepcopy(fixed_features)
+        search_space = search_space.clone()
 
         # Transform
         for t in self.transforms.values():
@@ -620,26 +780,50 @@ class ModelBridge(ABC):
                 )
             for metric, po in pending_observations.items():
                 pending_observations[metric] = t.transform_observation_features(po)
-            fixed_features = t.transform_observation_features([fixed_features])[0]
+            fixed_features = (
+                t.transform_observation_features([fixed_features])[0]
+                if fixed_features is not None
+                else None
+            )
         return BaseGenArgs(
             search_space=search_space,
-            # pyre-fixme[6]: Expected `OptimizationConfig` for 2nd param but got
-            #  `Optional[OptimizationConfig]`.
             optimization_config=optimization_config,
             pending_observations=pending_observations,
             fixed_features=fixed_features,
         )
 
+    def _validate_gen_inputs(
+        self,
+        n: int,
+        search_space: SearchSpace | None = None,
+        optimization_config: OptimizationConfig | None = None,
+        pending_observations: dict[str, list[ObservationFeatures]] | None = None,
+        fixed_features: ObservationFeatures | None = None,
+        model_gen_options: TConfig | None = None,
+    ) -> None:
+        """Validate inputs to `ModelBridge.gen`.
+
+        Currently, this is only used to ensure that `n` is a positive integer.
+        """
+        if n < 1:
+            raise UserInputError(
+                f"Attempted to generate n={n} points. Number of points to generate "
+                "must be a positive integer."
+            )
+
     def gen(
         self,
         n: int,
-        search_space: Optional[SearchSpace] = None,
-        optimization_config: Optional[OptimizationConfig] = None,
-        pending_observations: Optional[Dict[str, List[ObservationFeatures]]] = None,
-        fixed_features: Optional[ObservationFeatures] = None,
-        model_gen_options: Optional[TConfig] = None,
+        search_space: SearchSpace | None = None,
+        optimization_config: OptimizationConfig | None = None,
+        pending_observations: dict[str, list[ObservationFeatures]] | None = None,
+        fixed_features: ObservationFeatures | None = None,
+        model_gen_options: TConfig | None = None,
     ) -> GeneratorRun:
         """
+        Generate new points from the underlying model according to
+        search_space, optimization_config and other parameters.
+
         Args:
             n: Number of points to generate
             search_space: Search space
@@ -650,23 +834,32 @@ class ModelBridge(ABC):
                 features that should be fixed at specified values during
                 generation.
             model_gen_options: A config dictionary that is passed along to the
-                model.
+                model. See `TorchOptConfig` for details.
+
+        Returns:
+            A GeneratorRun object that contains the generated points and other metadata.
         """
+        self._validate_gen_inputs(
+            n=n,
+            search_space=search_space,
+            optimization_config=optimization_config,
+            pending_observations=pending_observations,
+            fixed_features=fixed_features,
+            model_gen_options=model_gen_options,
+        )
         t_gen_start = time.monotonic()
         # Get modifiable versions
         if search_space is None:
-            search_space = self._model_space
-        orig_search_space = search_space
-        search_space = search_space.clone()
+            search_space = self._search_space
+        orig_search_space = search_space.clone()
         base_gen_args = self._get_transformed_gen_args(
             search_space=search_space,
             optimization_config=optimization_config,
             pending_observations=pending_observations,
             fixed_features=fixed_features,
         )
-
         # Apply terminal transform and gen
-        observation_features, weights, best_obsf, gen_metadata = self._gen(
+        gen_results = self._gen(
             n=n,
             search_space=base_gen_args.search_space,
             optimization_config=base_gen_args.optimization_config,
@@ -674,8 +867,12 @@ class ModelBridge(ABC):
             fixed_features=base_gen_args.fixed_features,
             model_gen_options=model_gen_options,
         )
+
+        observation_features = gen_results.observation_features
+        best_obsf = gen_results.best_observation_features
+
         # Apply reverse transforms
-        for t in reversed(self.transforms.values()):  # noqa T484
+        for t in reversed(list(self.transforms.values())):
             observation_features = t.untransform_observation_features(
                 observation_features
             )
@@ -699,7 +896,7 @@ class ModelBridge(ABC):
                 best_point_predictions = extract_arm_predictions(
                     model_predictions=self.predict([best_obsf]), arm_idx=0
                 )
-        except NotImplementedError:  # pragma: no cover
+        except NotImplementedError:
             model_predictions = None
 
         if best_obsf is None:
@@ -723,22 +920,28 @@ class ModelBridge(ABC):
         optimization_config = None if immutable else base_gen_args.optimization_config
         gr = GeneratorRun(
             arms=arms,
-            weights=weights,
+            weights=gen_results.weights,
             optimization_config=optimization_config,
-            search_space=None if immutable else base_gen_args.search_space,
+            search_space=None if immutable else orig_search_space,
             model_predictions=model_predictions,
-            best_arm_predictions=None
-            if best_arm is None
-            else (best_arm, best_point_predictions),
+            best_arm_predictions=(
+                None if best_arm is None else (best_arm, best_point_predictions)
+            ),
             fit_time=self.fit_time_since_gen,
             gen_time=time.monotonic() - t_gen_start,
             model_key=self._model_key,
             model_kwargs=self._model_kwargs,
             bridge_kwargs=self._bridge_kwargs,
-            gen_metadata=gen_metadata,
+            gen_metadata=gen_results.gen_metadata,
             model_state_after_gen=self._get_serialized_model_state(),
             candidate_metadata_by_arm_signature=candidate_metadata,
         )
+        if len(gr.arms) < n:
+            logger.warning(
+                f"{self} was not able to generate {n} unique candidates. "
+                "Generated arms have the following weights, as there are repeats:\n"
+                f"{gr.weights}"
+            )
         self.fit_time_since_gen = 0.0
         return gr
 
@@ -746,168 +949,111 @@ class ModelBridge(ABC):
         self,
         n: int,
         search_space: SearchSpace,
-        optimization_config: Optional[OptimizationConfig],
-        pending_observations: Dict[str, List[ObservationFeatures]],
-        fixed_features: ObservationFeatures,
-        model_gen_options: Optional[TConfig],
-    ) -> Tuple[
-        List[ObservationFeatures],
-        List[float],
-        Optional[ObservationFeatures],
-        TGenMetadata,
-    ]:
+        optimization_config: OptimizationConfig | None,
+        pending_observations: dict[str, list[ObservationFeatures]],
+        fixed_features: ObservationFeatures | None,
+        model_gen_options: TConfig | None,
+    ) -> GenResults:
         """Apply terminal transform, gen, and reverse terminal transform on
         output.
         """
-        raise NotImplementedError  # pragma: no cover
+        raise ModelBridgeMethodNotImplementedError(
+            f"{self.__class__.__name__} does not implement `_gen`."
+        )
 
     def cross_validate(
         self,
-        cv_training_data: List[Observation],
-        cv_test_points: List[ObservationFeatures],
-    ) -> List[ObservationData]:
+        cv_training_data: list[Observation],
+        cv_test_points: list[ObservationFeatures],
+        use_posterior_predictive: bool = False,
+    ) -> list[ObservationData]:
         """Make a set of cross-validation predictions.
+
+        Args:
+            cv_training_data: The training data to use for cross validation.
+            cv_test_points: The test points at which predictions will be made.
+            use_posterior_predictive: A boolean indicating if the predictions
+                should be from the posterior predictive (i.e. including
+                observation noise).
+
+        Returns:
+            A list of predictions at the test points.
+        """
+        # Apply transforms to cv_training_data and cv_test_points
+        cv_training_data, cv_test_points, search_space = self._transform_inputs_for_cv(
+            cv_training_data=cv_training_data, cv_test_points=cv_test_points
+        )
+
+        # Apply terminal transform, and get predictions.
+        with warnings.catch_warnings():
+            # Since each CV fold removes points from the training data, the remaining
+            # observations will not pass the standardization test. To avoid confusing
+            # users with this warning, we filter it out.
+            warnings.filterwarnings(
+                "ignore",
+                message=r"Data \(outcome observations\) is not standardized",
+                category=InputDataWarning,
+            )
+            cv_predictions = self._cross_validate(
+                search_space=search_space,
+                cv_training_data=cv_training_data,
+                cv_test_points=cv_test_points,
+                use_posterior_predictive=use_posterior_predictive,
+            )
+        # Apply reverse transforms, in reverse order
+        cv_test_observations = [
+            Observation(features=obsf, data=cv_predictions[i])
+            for i, obsf in enumerate(cv_test_points)
+        ]
+
+        for t in reversed(list(self.transforms.values())):
+            cv_test_observations = t.untransform_observations(cv_test_observations)
+        return [obs.data for obs in cv_test_observations]
+
+    def _cross_validate(
+        self,
+        search_space: SearchSpace,
+        cv_training_data: list[Observation],
+        cv_test_points: list[ObservationFeatures],
+        use_posterior_predictive: bool = False,
+    ) -> list[ObservationData]:
+        """Apply the terminal transform, make predictions on the test points,
+        and reverse terminal transform on the results.
+        """
+        raise ModelBridgeMethodNotImplementedError(
+            f"{self.__class__.__name__} does not implement `_cross_validate`."
+        )
+
+    def _transform_inputs_for_cv(
+        self,
+        cv_training_data: list[Observation],
+        cv_test_points: list[ObservationFeatures],
+    ) -> tuple[list[Observation], list[ObservationFeatures], SearchSpace]:
+        """Apply transforms to cv_training_data and cv_test_points,
+        and return cv_training_data, cv_test_points, and search space in
+        transformed space. This is to prepare data to be used in _cross_validate.
 
         Args:
             cv_training_data: The training data to use for cross validation.
             cv_test_points: The test points at which predictions will be made.
 
         Returns:
-            A list of predictions at the test points.
-        """
-        # Apply transforms to cv_training_data and cv_test_points
+            cv_training_data, cv_test_points, and search space
+            in transformed space."""
         cv_test_points = deepcopy(cv_test_points)
-        obs_feats, obs_data = separate_observations(
-            observations=cv_training_data, copy=True
-        )
+        cv_training_data = deepcopy(cv_training_data)
         search_space = self._model_space.clone()
         for t in self.transforms.values():
-            obs_feats = t.transform_observation_features(obs_feats)
-            obs_data = t.transform_observation_data(obs_data, obs_feats)
+            cv_training_data = t.transform_observations(cv_training_data)
             cv_test_points = t.transform_observation_features(cv_test_points)
             search_space = t.transform_search_space(search_space)
-
-        # Apply terminal transform, and get predictions.
-        cv_predictions = self._cross_validate(
-            search_space=search_space,
-            obs_feats=obs_feats,
-            obs_data=obs_data,
-            cv_test_points=cv_test_points,
-        )
-        # Apply reverse transforms, in reverse order
-        for t in reversed(self.transforms.values()):
-            cv_test_points = t.untransform_observation_features(cv_test_points)
-            cv_predictions = t.untransform_observation_data(
-                cv_predictions, cv_test_points
-            )
-        return cv_predictions
-
-    def _cross_validate(
-        self,
-        search_space: SearchSpace,
-        obs_feats: List[ObservationFeatures],
-        obs_data: List[ObservationData],
-        cv_test_points: List[ObservationFeatures],
-    ) -> List[ObservationData]:
-        """Apply the terminal transform, make predictions on the test points,
-        and reverse terminal transform on the results.
-        """
-        raise NotImplementedError  # pragma: no cover
-
-    def evaluate_acquisition_function(
-        self,
-        observation_features: Union[
-            List[ObservationFeatures], List[List[ObservationFeatures]]
-        ],
-        search_space: Optional[SearchSpace] = None,
-        optimization_config: Optional[OptimizationConfig] = None,
-        objective_thresholds: Optional[np.ndarray] = None,
-        outcome_constraints: Optional[Tuple[np.ndarray, np.ndarray]] = None,
-        linear_constraints: Optional[Tuple[np.ndarray, np.ndarray]] = None,
-        fixed_features: Optional[Dict[int, float]] = None,
-        pending_observations: Optional[List[np.ndarray]] = None,
-        acq_options: Optional[Dict[str, Any]] = None,
-    ) -> List[float]:
-        """Evaluate the acquisition function for given set of observation
-        features.
-
-        Args:
-            observation_features: Either a list or a list of lists of observation
-                features, representing parameterizations, for which to evaluate the
-                acquisition function. If a single list is passed, the acquisition
-                function is evaluated for each observation feature. If a list of lists
-                is passed each element (itself a list of observation features)
-                represents a batch of points for which to evaluate the joint acquisition
-                value.
-            search_space: Search space for fitting the model.
-            optimization_config: Optimization config defining how to optimize
-                the model.
-            objective_thresholds:  The `m`-dim tensor of objective thresholds. There is
-                one for each modeled metric.
-            outcome_constraints: A tuple of (A, b). For k outcome constraints and m
-                outputs at f(x), A is (k x m) and b is (k x 1) such that A f(x) <= b.
-                (Not used by single task models)
-            linear_constraints: A tuple of (A, b). For k linear constraints on
-                d-dimensional x, A is (k x d) and b is (k x 1) such that A x <= b.
-            fixed_features: A map {feature_index: value} for features that should be
-                held fixed during the evaluation.
-            pending_observations:  A list of m (k_i x d) feature tensors X for m
-                outcomes and k_i pending observations for outcome i.
-            acq_options: Keyword arguments used to contruct the acquisition function.
-
-        Returns:
-            A list of acquisition function values, in the same order as the
-            input observation features.
-        """
-        search_space = self._get_transformed_gen_args(
-            search_space=search_space or self._model_space,
-        ).search_space
-        optimization_config = optimization_config or self._optimization_config
-        if optimization_config is None:
-            raise ValueError(
-                "The `optimization_config` must be specified either while initializing "
-                "the ModelBridge or to the `evaluate_acquisition_function` call."
-            )
-        # pyre-ignore Incompatible parameter type [9]
-        obs_feats: List[List[ObservationFeatures]] = deepcopy(observation_features)
-        if not isinstance(obs_feats[0], list):
-            obs_feats = [[obs] for obs in obs_feats]
-
-        for t in self.transforms.values():
-            for i, batch in enumerate(obs_feats):
-                obs_feats[i] = t.transform_observation_features(batch)
-
-        return self._evaluate_acquisition_function(
-            observation_features=obs_feats,
-            search_space=search_space,
-            optimization_config=optimization_config,
-            objective_thresholds=objective_thresholds,
-            outcome_constraints=outcome_constraints,
-            linear_constraints=linear_constraints,
-            fixed_features=fixed_features,
-            pending_observations=pending_observations,
-            acq_options=acq_options,
-        )
-
-    def _evaluate_acquisition_function(
-        self,
-        observation_features: List[List[ObservationFeatures]],
-        search_space: SearchSpace,
-        optimization_config: OptimizationConfig,
-        objective_thresholds: Optional[np.ndarray] = None,
-        outcome_constraints: Optional[Tuple[np.ndarray, np.ndarray]] = None,
-        linear_constraints: Optional[Tuple[np.ndarray, np.ndarray]] = None,
-        fixed_features: Optional[Dict[int, float]] = None,
-        pending_observations: Optional[List[np.ndarray]] = None,
-        acq_options: Optional[Dict[str, Any]] = None,
-    ) -> List[float]:
-        raise NotImplementedError  # pragma: no cover
+        return cv_training_data, cv_test_points, search_space
 
     def _set_kwargs_to_save(
         self,
         model_key: str,
-        model_kwargs: Dict[str, Any],
-        bridge_kwargs: Dict[str, Any],
+        model_kwargs: dict[str, Any],
+        bridge_kwargs: dict[str, Any],
     ) -> None:
         """Set properties used to save the model that created a given generator
         run, on the `GeneratorRun` object. Each generator run produced by the
@@ -918,27 +1064,45 @@ class ModelBridge(ABC):
         self._model_kwargs = model_kwargs
         self._bridge_kwargs = bridge_kwargs
 
-    def _get_serialized_model_state(self) -> Dict[str, Any]:
+    def _get_serialized_model_state(self) -> dict[str, Any]:
         """Obtains the state of the underlying model (if using a stateful one)
         in a readily JSON-serializable form.
         """
-        model = not_none(self.model)
+        model = none_throws(self.model)
         return model.serialize_state(raw_state=model._get_state())
 
     def _deserialize_model_state(
-        self, serialized_state: Dict[str, Any]
-    ) -> Dict[str, Any]:
-        model = not_none(self.model)
+        self, serialized_state: dict[str, Any]
+    ) -> dict[str, Any]:
+        model = none_throws(self.model)
         return model.deserialize_state(serialized_state=serialized_state)
 
-    def feature_importances(self, metric_name: str) -> Dict[str, float]:
-        raise NotImplementedError(
-            "Feature importance not available for this model type"
+    def feature_importances(self, metric_name: str) -> dict[str, float]:
+        """Computes feature importances for a single metric.
+
+        Depending on the type of the model, this method will approach sensitivity
+        analysis (calculating the sensitivity of the metric to changes in the search
+        space's parameters, a.k.a. features) differently.
+
+        For Bayesian optimization models (BoTorch models), this method uses parameter
+        inverse lengthscales to compute normalized feature importances.
+
+        NOTE: Currently, this is only implemented for GP models.
+
+        Args:
+            metric_name: Name of metric to compute feature importances for.
+
+        Returns:
+            A dictionary mapping parameter names to their corresponding feature
+            importances.
+
+        """
+        raise ModelBridgeMethodNotImplementedError(
+            f"{self.__class__.__name__} does not implement `feature_importances`."
         )
 
-    def transform_observation_data(
-        self, observation_data: List[ObservationData]
-    ) -> Any:
+    # pyre-fixme[3]: Return annotation cannot be `Any`.
+    def transform_observations(self, observations: list[Observation]) -> Any:
         """Applies transforms to given observation features and returns them in the
         model space.
 
@@ -949,20 +1113,22 @@ class ModelBridge(ABC):
             Transformed values. This could be e.g. a torch Tensor, depending
             on the ModelBridge subclass.
         """
-        obsd = deepcopy(observation_data)
+        observations = deepcopy(observations)
         for t in self.transforms.values():
-            obsd = t.transform_observation_data(obsd, [])
+            observations = t.transform_observations(observations)
         # Apply terminal transform and return
-        return self._transform_observation_data(obsd)
+        return self._transform_observations(observations)
 
-    def _transform_observation_data(
-        self, observation_data: List[ObservationData]
-    ) -> Any:
-        """Apply terminal transform to given observation features and return result."""
-        raise NotImplementedError  # pragma: no cover
+    # pyre-fixme[3]: Return annotation cannot be `Any`.
+    def _transform_observations(self, observations: list[Observation]) -> Any:
+        """Apply terminal transform to given observations and return result."""
+        raise ModelBridgeMethodNotImplementedError(
+            f"{self.__class__.__name__} does not implement `_transform_observations`."
+        )
 
+    # pyre-fixme[3]: Return annotation cannot be `Any`.
     def transform_observation_features(
-        self, observation_features: List[ObservationFeatures]
+        self, observation_features: list[ObservationFeatures]
     ) -> Any:
         """Applies transforms to given observation features and returns them in the
         model space.
@@ -980,38 +1146,21 @@ class ModelBridge(ABC):
         # Apply terminal transform and return
         return self._transform_observation_features(obsf)
 
+    # pyre-fixme[3]: Return annotation cannot be `Any`.
     def _transform_observation_features(
-        self, observation_features: List[ObservationFeatures]
+        self, observation_features: list[ObservationFeatures]
     ) -> Any:
         """Apply terminal transform to given observation features and return result."""
-        raise NotImplementedError  # pragma: no cover
+        raise ModelBridgeMethodNotImplementedError(
+            f"{self.__class__.__name__} does not implement "
+            "`_transform_observation_features`."
+        )
 
-    def transform_optimization_config(
-        self,
-        optimization_config: OptimizationConfig,
-        fixed_features: ObservationFeatures,
-    ) -> Any:
-        """Applies transforms to given optimization config.
-
-        Args:
-            optimization_config: OptimizationConfig to transform.
-            fixed_features: features which should not be transformed.
-
-        Returns:
-            Transformed values. This could be e.g. a torch Tensor, depending
-            on the ModelBridge subclass.
-        """
-        optimization_config = optimization_config.clone()
-        for t in self.transforms.values():
-            optimization_config = t.transform_optimization_config(
-                optimization_config=optimization_config,
-                modelbridge=self,
-                fixed_features=fixed_features,
-            )
-        return optimization_config
+    def __repr__(self) -> str:
+        return f"{self.__class__.__name__}(model={self.model})"
 
 
-def unwrap_observation_data(observation_data: List[ObservationData]) -> TModelPredict:
+def unwrap_observation_data(observation_data: list[ObservationData]) -> TModelPredict:
     """Converts observation data to the format for model prediction outputs.
     That format assumes each observation data has the same set of metrics.
     """
@@ -1034,9 +1183,9 @@ def unwrap_observation_data(observation_data: List[ObservationData]) -> TModelPr
 
 
 def gen_arms(
-    observation_features: List[ObservationFeatures],
-    arms_by_signature: Optional[Dict[str, Arm]] = None,
-) -> Tuple[List[Arm], Optional[Dict[str, TCandidateMetadata]]]:
+    observation_features: list[ObservationFeatures],
+    arms_by_signature: dict[str, Arm] | None = None,
+) -> tuple[list[Arm], dict[str, TCandidateMetadata] | None]:
     """Converts observation features to a tuple of arms list and candidate metadata
     dict, where arm signatures are mapped to their respective candidate metadata.
     """
@@ -1055,8 +1204,8 @@ def gen_arms(
 
 
 def clamp_observation_features(
-    observation_features: List[ObservationFeatures], search_space: SearchSpace
-) -> List[ObservationFeatures]:
+    observation_features: list[ObservationFeatures], search_space: SearchSpace
+) -> list[ObservationFeatures]:
     range_parameters = [
         p for p in search_space.parameters.values() if isinstance(p, RangeParameter)
     ]
@@ -1081,3 +1230,47 @@ def clamp_observation_features(
                 )
                 obsf.parameters[p.name] = p.upper
     return observation_features
+
+
+def _get_status_quo_by_trial(
+    observations: list[Observation],
+    status_quo_name: str | None = None,
+    status_quo_features: ObservationFeatures | None = None,
+) -> dict[int, ObservationData] | None:
+    r"""
+    Given a status quo observation, return a dictionary of trial index to
+    the status quo observation data of each trial.
+
+    When either `status_quo_name` or `status_quo_features` exists, return the dict;
+    when both exist, use `status_quo_name`;
+    when neither exists, return None.
+
+    Args:
+        observations: List of observations.
+        status_quo_name: Name of the status quo.
+        status_quo_features: ObservationFeatures for the status quo.
+
+    Returns:
+        A map from trial index to status quo observation data, or None
+    """
+    trial_idx_to_sq_data = None
+    if status_quo_name is not None:
+        # identify status quo by arm name
+        trial_idx_to_sq_data = {
+            int(none_throws(obs.features.trial_index)): obs.data
+            for obs in observations
+            if obs.arm_name == status_quo_name
+        }
+    elif status_quo_features is not None:
+        # identify status quo by (untransformed) feature
+        status_quo_signature = json.dumps(
+            status_quo_features.parameters, sort_keys=True
+        )
+        trial_idx_to_sq_data = {
+            int(none_throws(obs.features.trial_index)): obs.data
+            for obs in observations
+            if json.dumps(obs.features.parameters, sort_keys=True)
+            == status_quo_signature
+        }
+
+    return trial_idx_to_sq_data

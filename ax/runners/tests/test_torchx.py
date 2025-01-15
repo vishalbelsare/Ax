@@ -4,10 +4,11 @@
 # This source code is licensed under the MIT license found in the
 # LICENSE file in the root directory of this source tree.
 
+# pyre-strict
+
 import os
 import shutil
 import tempfile
-from typing import List
 
 from ax.core import (
     BatchTrial,
@@ -30,12 +31,13 @@ from torchx.components import utils
 
 class TorchXRunnerTest(TestCase):
     def setUp(self) -> None:
+        super().setUp()
         self.test_dir = tempfile.mkdtemp("torchx_runtime_hpo_ax_test")
 
         self.old_cwd = os.getcwd()
         os.chdir(os.path.dirname(os.path.dirname(__file__)))
 
-        self._parameters: List[Parameter] = [
+        self._parameters: list[Parameter] = [
             RangeParameter(
                 name="x1",
                 lower=-10.0,
@@ -95,8 +97,8 @@ class TorchXRunnerTest(TestCase):
             for _ in range(3):
                 scheduler.run_n_trials(max_trials=2)
 
-            # TorchXMetric always returns trial index; hence the best experiment for min
-            # objective will be the params for trial 0.
+            # TorchXMetric always returns trial index; hence the best experiment
+            # for min objective will be the params for trial 0.
             scheduler.report_results()
         except FailureRateExceededError:
             pass  # TODO(ehotaj): Figure out why this test fails in OSS.
@@ -128,8 +130,8 @@ class TorchXRunnerTest(TestCase):
     def test_run_experiment_locally_in_batches(self) -> None:
         """Runs optimization over k x n rounds of k parallel trials.
 
-        This asks Ax to run up to max_parallelism_cap trials in parallel by submitting
-        them to the scheduler at the same time.
+        This asks Ax to run up to max_parallelism_cap trials in parallel by
+        submitting them to the scheduler at the same time.
 
         NOTE:
             * setting max_parallelism_cap in generation_strategy
@@ -165,8 +167,8 @@ class TorchXRunnerTest(TestCase):
         try:
             scheduler.run_all_trials()
 
-            # TorchXMetric always returns trial index; hence the best experiment for min
-            # objective will be the params for trial 0.
+            # TorchXMetric always returns trial index; hence the best experiment
+            # for min objective will be the params for trial 0.
             scheduler.report_results()
         except FailureRateExceededError:
             pass  # TODO(ehotaj): Figure out why this test fails in OSS.

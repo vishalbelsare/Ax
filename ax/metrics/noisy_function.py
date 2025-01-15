@@ -4,16 +4,22 @@
 # This source code is licensed under the MIT license found in the
 # LICENSE file in the root directory of this source tree.
 
+# pyre-strict
+
 from __future__ import annotations
 
-from typing import Any, Callable, List, Optional
+from collections.abc import Callable
+
+from typing import Any
 
 import numpy as np
+import numpy.typing as npt
 import pandas as pd
 from ax.core.base_trial import BaseTrial
 from ax.core.data import Data
-from ax.core.metric import Metric
+from ax.core.metric import Metric, MetricFetchE, MetricFetchResult
 from ax.core.types import TParameterization
+from ax.utils.common.result import Err, Ok
 
 
 class NoisyFunctionMetric(Metric):
@@ -24,9 +30,9 @@ class NoisyFunctionMetric(Metric):
     def __init__(
         self,
         name: str,
-        param_names: List[str],
-        noise_sd: Optional[float] = 0.0,
-        lower_is_better: Optional[bool] = None,
+        param_names: list[str],
+        noise_sd: float | None = 0.0,
+        lower_is_better: bool | None = None,
     ) -> None:
         """
         Metric is computed by evaluating a deterministic function, implemented
@@ -41,7 +47,7 @@ class NoisyFunctionMetric(Metric):
             param_names: An ordered list of names of parameters to be passed
                 to the deterministic function.
             noise_sd: Scale of normal noise added to the function result. If
-                None, interpret the function as nosiy with unknown noise level.
+                None, interpret the function as noisy with unknown noise level.
             lower_is_better: Flag for metrics which should be minimized.
         """
         self.param_names = param_names
@@ -62,37 +68,44 @@ class NoisyFunctionMetric(Metric):
 
     def fetch_trial_data(
         self, trial: BaseTrial, noisy: bool = True, **kwargs: Any
-    ) -> Data:
-        noise_sd = self.noise_sd if noisy else 0.0
-        arm_names = []
-        mean = []
-        for name, arm in trial.arms_by_name.items():
-            arm_names.append(name)
-            val = self._evaluate(params=arm.parameters)
-            if noise_sd:
-                val = val + noise_sd * np.random.randn()
-            mean.append(val)
-        # indicate unknown noise level in data
-        if noise_sd is None:
-            noise_sd = float("nan")
-        df = pd.DataFrame(
-            {
-                "arm_name": arm_names,
-                "metric_name": self.name,
-                "mean": mean,
-                "sem": noise_sd,
-                "trial_index": trial.index,
-                "n": 10000 / len(arm_names),
-                "frac_nonnull": mean,
-            }
-        )
-        return Data(df=df)
+    ) -> MetricFetchResult:
+        try:
+            noise_sd = self.noise_sd if noisy else 0.0
+            arm_names = []
+            mean = []
+            for name, arm in trial.arms_by_name.items():
+                arm_names.append(name)
+                val = self._evaluate(params=arm.parameters)
+                if noise_sd:
+                    val = val + noise_sd * np.random.randn()
+                mean.append(val)
+            # indicate unknown noise level in data
+            if noise_sd is None:
+                noise_sd = float("nan")
+            df = pd.DataFrame(
+                {
+                    "arm_name": arm_names,
+                    "metric_name": self.name,
+                    "mean": mean,
+                    "sem": noise_sd,
+                    "trial_index": trial.index,
+                    "n": 10000 / len(arm_names),
+                    "frac_nonnull": mean,
+                }
+            )
+
+            return Ok(value=Data(df=df))
+
+        except Exception as e:
+            return Err(
+                MetricFetchE(message=f"Failed to fetch {self.name}", exception=e)
+            )
 
     def _evaluate(self, params: TParameterization) -> float:
         x = np.array([params[p] for p in self.param_names])
         return self.f(x)
 
-    def f(self, x: np.ndarray) -> float:
+    def f(self, x: npt.NDArray) -> float:
         """The deterministic function that produces the metric outcomes."""
         raise NotImplementedError
 
@@ -102,8 +115,8 @@ class GenericNoisyFunctionMetric(NoisyFunctionMetric):
         self,
         name: str,
         f: Callable[[TParameterization], float],
-        noise_sd: Optional[float] = 0.0,
-        lower_is_better: Optional[bool] = None,
+        noise_sd: float | None = 0.0,
+        lower_is_better: bool | None = None,
     ) -> None:
         """
         Metric is computed by evaluating a deterministic function, implemented in f.
@@ -113,7 +126,7 @@ class GenericNoisyFunctionMetric(NoisyFunctionMetric):
             f: A callable accepting a dictionary from parameter names to
                 values and returning a float metric value.
             noise_sd: Scale of normal noise added to the function result. If
-                None, interpret the function as nosiy with unknown noise level.
+                None, interpret the function as noisy with unknown noise level.
             lower_is_better: Flag for metrics which should be minimized.
 
         Note: Since this metric setup uses a generic callable it cannot be serialized
@@ -124,7 +137,7 @@ class GenericNoisyFunctionMetric(NoisyFunctionMetric):
         Metric.__init__(self, name=name, lower_is_better=lower_is_better)
 
     @property
-    def param_names(self) -> List[str]:
+    def param_names(self) -> list[str]:
         raise NotImplementedError(
             "GenericNoisyFunctionMetric does not implement a param_names attribute"
         )

@@ -4,6 +4,8 @@
 # This source code is licensed under the MIT license found in the
 # LICENSE file in the root directory of this source tree.
 
+# pyre-strict
+
 
 import numpy as np
 from ax.exceptions.model import ModelError
@@ -12,7 +14,8 @@ from ax.utils.common.testutils import TestCase
 
 
 class ThompsonSamplerTest(TestCase):
-    def setUp(self):
+    def setUp(self) -> None:
+        super().setUp()
         self.Xs = [[[1, 1], [2, 2], [3, 3], [4, 4]]]  # 4 arms, each of dimensionality 2
         self.Ys = [[1, 2, 3, 4]]
         self.Yvars = [[1, 1, 1, 1]]
@@ -26,7 +29,7 @@ class ThompsonSamplerTest(TestCase):
         self.multiple_metrics_Ys = [[1, 2, 3, 4], [0, 0, 0, 1]]
         self.multiple_metrics_Yvars = [[1, 1, 1, 1], [1, 1, 1, 1]]
 
-    def testThompsonSampler(self):
+    def test_ThompsonSampler(self) -> None:
         generator = ThompsonSampler(min_weight=0.0)
         generator.fit(
             Xs=self.Xs,
@@ -36,7 +39,9 @@ class ThompsonSamplerTest(TestCase):
             outcome_names=self.outcome_names,
         )
         arms, weights, gen_metadata = generator.gen(
-            n=3, parameter_values=self.parameter_values, objective_weights=np.ones(1)
+            n=3,
+            parameter_values=self.parameter_values,
+            objective_weights=np.ones(1),
         )
         self.assertEqual(arms, [[4, 4], [3, 3], [2, 2]])
         for weight, expected_weight in zip(
@@ -44,8 +49,9 @@ class ThompsonSamplerTest(TestCase):
         ):
             self.assertAlmostEqual(weight, expected_weight, 1)
         self.assertEqual(len(gen_metadata["arms_to_weights"]), 4)
+        self.assertEqual(gen_metadata["best_x"], arms[0])
 
-    def testThompsonSamplerValidation(self):
+    def test_ThompsonSamplerValidation(self) -> None:
         generator = ThompsonSampler(min_weight=0.01)
 
         # all Xs are not the same
@@ -81,7 +87,7 @@ class ThompsonSamplerTest(TestCase):
         with self.assertRaises(ValueError):
             generator.gen(5, self.parameter_values, objective_weights=None)
 
-    def testThompsonSamplerMinWeight(self):
+    def test_ThompsonSamplerMinWeight(self) -> None:
         generator = ThompsonSampler(min_weight=0.01)
         generator.fit(
             Xs=self.Xs,
@@ -91,7 +97,9 @@ class ThompsonSamplerTest(TestCase):
             outcome_names=self.outcome_names,
         )
         arms, weights, _ = generator.gen(
-            n=5, parameter_values=self.parameter_values, objective_weights=np.ones(1)
+            n=5,
+            parameter_values=self.parameter_values,
+            objective_weights=np.ones(1),
         )
         self.assertEqual(arms, [[4, 4], [3, 3], [2, 2]])
         for weight, expected_weight in zip(
@@ -99,7 +107,7 @@ class ThompsonSamplerTest(TestCase):
         ):
             self.assertAlmostEqual(weight, expected_weight, 1)
 
-    def testThompsonSamplerUniformWeights(self):
+    def test_ThompsonSamplerUniformWeights(self) -> None:
         generator = ThompsonSampler(min_weight=0.0, uniform_weights=True)
         generator.fit(
             Xs=self.Xs,
@@ -109,13 +117,15 @@ class ThompsonSamplerTest(TestCase):
             outcome_names=self.outcome_names,
         )
         arms, weights, _ = generator.gen(
-            n=3, parameter_values=self.parameter_values, objective_weights=np.ones(1)
+            n=3,
+            parameter_values=self.parameter_values,
+            objective_weights=np.ones(1),
         )
         self.assertEqual(arms, [[4, 4], [3, 3], [2, 2]])
         for weight, expected_weight in zip(weights, [1.0, 1.0, 1.0]):
             self.assertAlmostEqual(weight, expected_weight, 1)
 
-    def testThompsonSamplerInfeasible(self):
+    def test_ThompsonSamplerInfeasible(self) -> None:
         generator = ThompsonSampler(min_weight=0.9)
         generator.fit(
             Xs=self.Xs,
@@ -131,7 +141,7 @@ class ThompsonSamplerTest(TestCase):
                 objective_weights=np.ones(1),
             )
 
-    def testThompsonSamplerOutcomeConstraints(self):
+    def test_ThompsonSamplerOutcomeConstraints(self) -> None:
         generator = ThompsonSampler(min_weight=0.0)
         generator.fit(
             Xs=self.multiple_metrics_Xs,
@@ -157,7 +167,7 @@ class ThompsonSamplerTest(TestCase):
         ):
             self.assertAlmostEqual(weight, expected_weight, delta=0.15)
 
-    def testThompsonSamplerOutcomeConstraintsInfeasible(self):
+    def test_ThompsonSamplerOutcomeConstraintsInfeasible(self) -> None:
         generator = ThompsonSampler(min_weight=0.0)
         generator.fit(
             Xs=self.multiple_metrics_Xs,
@@ -174,7 +184,7 @@ class ThompsonSamplerTest(TestCase):
                 outcome_constraints=(np.array([[0, 1]]), np.array([[-10]])),
             )
 
-    def testThompsonSamplerPredict(self):
+    def test_ThompsonSamplerPredict(self) -> None:
         generator = ThompsonSampler(min_weight=0.0)
         generator.fit(
             Xs=self.Xs,

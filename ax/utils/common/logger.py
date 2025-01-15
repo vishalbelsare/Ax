@@ -8,8 +8,12 @@
 
 import logging
 import os
+import re
+from collections.abc import Callable, Iterable
 from functools import wraps
-from typing import Any, Callable, TypeVar, Iterable
+from typing import Any, TypeVar
+
+from ax.utils.common.decorator import ClassDecorator
 
 AX_ROOT_LOGGER_NAME = "ax"
 DEFAULT_LOG_LEVEL: int = logging.INFO
@@ -28,7 +32,9 @@ class AxOutputNameFilter(logging.Filter):
         return True
 
 
-def get_logger(name: str) -> logging.Logger:
+def get_logger(
+    name: str, level: int = DEFAULT_LOG_LEVEL, force_name: bool = False
+) -> logging.Logger:
     """Get an Axlogger.
 
     To set a human-readable "output_name" that appears in logger outputs,
@@ -41,11 +47,20 @@ def get_logger(name: str) -> logging.Logger:
 
     Args:
         name: The name of the logger.
+        level: The level at which to actually log.  Logs
+            below this level of importance will be discarded
+        force_name: If set to false and the module specified
+            is not ultimately a descendent of the `ax` module
+            specified by `name`, "ax." will be prepended to `name`
 
     Returns:
         The logging.Logger object.
     """
+    # because handlers are attached to the "ax" module
+    if not force_name and not re.search(rf"^{AX_ROOT_LOGGER_NAME}(\.|$)", name):
+        name = f"{AX_ROOT_LOGGER_NAME}.{name}"
     logger = logging.getLogger(name)
+    logger.setLevel(level)
     logger.addFilter(AxOutputNameFilter())
     return logger
 
@@ -70,7 +85,7 @@ def build_stream_handler(level: int = DEFAULT_LOG_LEVEL) -> logging.StreamHandle
 
 def build_file_handler(
     filepath: str,
-    level: int = DEFAULT_LOG_LEVEL
+    level: int = DEFAULT_LOG_LEVEL,
     # pyre-fixme[24]: Generic type `logging.StreamHandler` expects 1 type parameter.
 ) -> logging.StreamHandler:
     """Build a file handle that logs entries to the given file, using the
@@ -135,7 +150,21 @@ def set_stderr_log_level(level: int) -> None:
     ROOT_STREAM_HANDLER.setLevel(level)
 
 
-class disable_logger:
+def set_ax_logger_levels(level: int) -> None:
+    """Set the log level for all Ax loggers, such that logs of given level
+    are printed to STDERR by the root logger
+    """
+
+    for axLogger in logging.Logger.manager.loggerDict.values():
+        if isinstance(axLogger, logging.Logger) and axLogger.name.startswith(
+            AX_ROOT_LOGGER_NAME
+        ):
+            axLogger.setLevel(level)
+
+    set_stderr_log_level(level)
+
+
+class disable_logger(ClassDecorator):
     def __init__(self, name: str, level: int = logging.ERROR) -> None:
         """Disables a specific logger by name (e.g. module path) by setting the
         log level at the given one for the duration of the decorated function's call
@@ -143,39 +172,41 @@ class disable_logger:
         self.name = name
         self.level = level
 
-    def decorate_class(self, klass: T) -> T:
-        for attr in dir(klass):
-            attr_value = getattr(klass, attr)
-            if (
-                not callable(attr_value)
-                or isinstance(attr_value, type)
-                or attr in ("__class__", "__repr__", "__str__")
-            ):
-                continue
+    def decorate_callable(self, func: Callable[..., T]) -> Callable[..., T]:
+        @wraps(func)
+        def inner(*args: Any, **kwargs: Any) -> T:
+            logger = logging.getLogger(self.name)
+            prev_level = logger.getEffectiveLevel()
+            logger.setLevel(self.level)
+            t = self._call_func(func, *args, **kwargs)
+            logger.setLevel(prev_level)
+            return t
 
-            setattr(klass, attr, self.decorate_callable(attr_value))
-        return klass
+        return inner
+
+
+class disable_loggers(ClassDecorator):
+    def __init__(self, names: list[str], level: int = logging.ERROR) -> None:
+        """Disables a specific logger by name (e.g. module path) by setting the
+        log level at the given one for the duration of the decorated function's call
+        """
+        self.names = names
+        self.level = level
 
     def decorate_callable(self, func: Callable[..., T]) -> Callable[..., T]:
         @wraps(func)
         def inner(*args: Any, **kwargs: Any) -> T:
-            logger = get_logger(self.name)
-            prev_level = logger.getEffectiveLevel()
-            logger.setLevel(self.level)
-            try:
-                return func(*args, **kwargs)
-            except TypeError:
-                # static functions
-                return func(*args[1:], **kwargs)
-            finally:
-                logger.setLevel(prev_level)
+            prev_levels = {}
+            for name in self.names:
+                logger = logging.getLogger(name)
+                prev_levels[name] = logger.getEffectiveLevel()
+                logger.setLevel(self.level)
+            t = self._call_func(func, *args, **kwargs)
+            for name in self.names:
+                logging.getLogger(name).setLevel(prev_levels[name])
+            return t
 
         return inner
-
-    def __call__(self, func: Callable[..., T]) -> Callable[..., T]:
-        if isinstance(func, type):
-            return self.decorate_class(func)
-        return self.decorate_callable(func)
 
 
 """Sets up Ax's root logger to not propogate to Python's root logger and

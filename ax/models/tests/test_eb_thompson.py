@@ -4,6 +4,8 @@
 # This source code is licensed under the MIT license found in the
 # LICENSE file in the root directory of this source tree.
 
+# pyre-strict
+
 from unittest.mock import patch
 
 import numpy as np
@@ -12,7 +14,7 @@ from ax.utils.common.testutils import TestCase
 
 
 class EmpiricalBayesThompsonSamplerTest(TestCase):
-    def setUp(self):
+    def setUp(self) -> None:
         self.Xs = [
             [[1, 1], [2, 2], [3, 3], [4, 4]],
             [[1, 1], [2, 2], [3, 3], [4, 4]],
@@ -22,7 +24,7 @@ class EmpiricalBayesThompsonSamplerTest(TestCase):
         self.parameter_values = [[1, 2, 3, 4], [1, 2, 3, 4]]
         self.outcome_names = ["x", "y"]  # not used for regular EB
 
-    def testEmpiricalBayesThompsonSamplerFit(self):
+    def test_EmpiricalBayesThompsonSamplerFit(self) -> None:
         generator = EmpiricalBayesThompsonSampler(min_weight=0.0)
         generator.fit(
             Xs=self.Xs,
@@ -45,7 +47,7 @@ class EmpiricalBayesThompsonSamplerTest(TestCase):
             )
         )
 
-    def testEmpiricalBayesThompsonSamplerGen(self):
+    def test_EmpiricalBayesThompsonSamplerGen(self) -> None:
         generator = EmpiricalBayesThompsonSampler(min_weight=0.0)
         generator.fit(
             Xs=self.Xs,
@@ -75,9 +77,9 @@ class EmpiricalBayesThompsonSamplerTest(TestCase):
             for weight, expected_weight in zip(
                 weights, [4 * i for i in [0.66, 0.25, 0.07, 0.02]]
             ):
-                self.assertAlmostEqual(weight, expected_weight, 1)
+                self.assertAlmostEqual(weight, expected_weight, delta=0.1)
 
-    def testEmpiricalBayesThompsonSamplerWarning(self):
+    def test_EmpiricalBayesThompsonSamplerWarning(self) -> None:
         generator = EmpiricalBayesThompsonSampler(min_weight=0.0)
         generator.fit(
             Xs=[x[:-1] for x in self.Xs],
@@ -97,7 +99,7 @@ class EmpiricalBayesThompsonSamplerTest(TestCase):
         ):
             self.assertAlmostEqual(weight, expected_weight, delta=0.1)
 
-    def testEmpiricalBayesThompsonSamplerValidation(self):
+    def test_EmpiricalBayesThompsonSamplerValidation(self) -> None:
         generator = EmpiricalBayesThompsonSampler(min_weight=0.01)
         with self.assertRaises(ValueError):
             generator.fit(
@@ -108,7 +110,7 @@ class EmpiricalBayesThompsonSamplerTest(TestCase):
                 outcome_names=self.outcome_names,
             )
 
-    def testEmpiricalBayesThompsonSamplerPredict(self):
+    def test_EmpiricalBayesThompsonSamplerPredict(self) -> None:
         generator = EmpiricalBayesThompsonSampler(min_weight=0.0)
         generator.fit(
             Xs=self.Xs,

@@ -2,19 +2,11 @@
     :class: hidden-section
 
 ax.metrics
-===================================
+==========
 
 .. automodule:: ax.metrics
 .. currentmodule:: ax.metrics
 
-
-BoTorch Test Problem
-~~~~~~
-
-.. automodule:: ax.metrics.botorch_test_problem
-    :members:
-    :undoc-members:
-    :show-inheritance:
 
 Branin
 ~~~~~~
@@ -41,13 +33,12 @@ Chemistry
     :show-inheritance:
 
 Curve
-~~~~~~~~~
+~~~~~
 
 .. automodule:: ax.metrics.curve
     :members:
     :undoc-members:
     :show-inheritance:
-
 
 Factorial
 ~~~~~~~~~
@@ -82,7 +73,7 @@ Noisy Functions
     :show-inheritance:
 
 Noisy Function Map
-~~~~~~~~~~~~~~~~~~~~
+~~~~~~~~~~~~~~~~~~
 
 .. automodule:: ax.metrics.noisy_function_map
     :members:
@@ -107,7 +98,7 @@ Tensorboard
 
 
 TorchX
-~~~~~~~~~~~
+~~~~~~
 
 .. automodule:: ax.metrics.torchx
     :members:

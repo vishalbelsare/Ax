@@ -4,32 +4,45 @@
 # This source code is licensed under the MIT license found in the
 # LICENSE file in the root directory of this source tree.
 
+# pyre-strict
+
 import dataclasses
 import datetime
 import enum
 from collections import OrderedDict
+from collections.abc import Callable
 from inspect import isclass
-from typing import Any, Callable, Dict, Type
+from typing import Any
 
 import numpy as np
 import pandas as pd
 import torch
-from ax.exceptions.storage import JSONEncodeError
+from ax.exceptions.storage import JSONEncodeError, STORAGE_DOCS_SUFFIX
+from ax.storage.json_store.encoders import tensor_to_dict
 from ax.storage.json_store.registry import (
     CORE_CLASS_ENCODER_REGISTRY,
     CORE_ENCODER_REGISTRY,
 )
 from ax.utils.common.serialization import _is_named_tuple
-from ax.utils.common.typeutils import numpy_type_to_python_type, torch_type_to_str
+from ax.utils.common.typeutils_nonnative import numpy_type_to_python_type
+from ax.utils.common.typeutils_torch import torch_type_to_str
 
 
-def object_to_json(
+# pyre-fixme[3]: Return annotation cannot be `Any`.
+def object_to_json(  # noqa C901
+    # pyre-fixme[2]: Parameter annotation cannot be `Any`.
     obj: Any,
-    encoder_registry: Dict[
-        Type, Callable[[Any], Dict[str, Any]]
+    # pyre-fixme[2]: Parameter annotation cannot contain `Any`.
+    # pyre-fixme[24]: Generic type `type` expects 1 type parameter, use
+    #  `typing.Type` to avoid runtime subscripting errors.
+    encoder_registry: dict[
+        type, Callable[[Any], dict[str, Any]]
     ] = CORE_ENCODER_REGISTRY,
-    class_encoder_registry: Dict[
-        Type, Callable[[Any], Dict[str, Any]]
+    # pyre-fixme[2]: Parameter annotation cannot contain `Any`.
+    # pyre-fixme[24]: Generic type `type` expects 1 type parameter, use
+    #  `typing.Type` to avoid runtime subscripting errors.
+    class_encoder_registry: dict[
+        type, Callable[[Any], dict[str, Any]]
     ] = CORE_CLASS_ENCODER_REGISTRY,
 ) -> Any:
     """Convert an Ax object to a JSON-serializable dictionary.
@@ -110,7 +123,7 @@ def object_to_json(
             for k, v in obj.items()
         }
     elif _is_named_tuple(obj):
-        return {  # pragma: no cover
+        return {
             "__type": _type.__name__,
             **{
                 k: object_to_json(
@@ -122,6 +135,7 @@ def object_to_json(
             },
         }
     elif dataclasses.is_dataclass(obj):
+        field_names = [f.name for f in dataclasses.fields(obj)]
         return {
             "__type": _type.__name__,
             **{
@@ -131,6 +145,7 @@ def object_to_json(
                     class_encoder_registry=class_encoder_registry,
                 )
                 for k, v in obj.__dict__.items()
+                if k in field_names
             },
         }
 
@@ -161,22 +176,10 @@ def object_to_json(
         return {"__type": _type.__name__, "name": obj.name}
     elif _type is np.ndarray or issubclass(_type, np.ndarray):
         return {"__type": _type.__name__, "value": obj.tolist()}
+    elif _type is set:
+        return {"__type": _type.__name__, "value": list(obj)}
     elif _type is torch.Tensor:
-        return {
-            "__type": _type.__name__,
-            # TODO: check size and add warning for large tensors: T69137799
-            "value": obj.tolist(),
-            "dtype": object_to_json(
-                obj.dtype,
-                encoder_registry=encoder_registry,
-                class_encoder_registry=class_encoder_registry,
-            ),
-            "device": object_to_json(
-                obj.device,
-                encoder_registry=encoder_registry,
-                class_encoder_registry=class_encoder_registry,
-            ),
-        }
+        return tensor_to_dict(obj=obj)
     elif _type.__module__ == "torch":
         # Torch does not support saving to string, so save to buffer first
         return {"__type": f"torch_{_type.__name__}", "value": torch_type_to_str(obj)}
@@ -184,6 +187,6 @@ def object_to_json(
     err = (
         f"Object {obj} passed to `object_to_json` (of type {_type}, module: "
         f"{_type.__module__}) is not registered with a corresponding encoder "
-        "in ENCODER_REGISTRY."
+        f"in ENCODER_REGISTRY. {STORAGE_DOCS_SUFFIX}"
     )
     raise JSONEncodeError(err)
